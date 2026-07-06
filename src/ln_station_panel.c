@@ -41,9 +41,10 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     panel->identity_entry = gtk_entry_new();
     panel->operator_entry = gtk_entry_new();
     panel->position_combo = gtk_combo_box_text_new();
-    panel->status_label = gtk_label_new("Scan or enter an identity to attach results.");
+    panel->status_label = gtk_label_new("Scan identity, then save LN Timing JSON.");
 
-    gtk_style_context_add_class(gtk_widget_get_style_context(title), "ln-station-title");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(panel->identity_entry), "LN-SER-00025 / watch serial");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(panel->operator_entry), "operator badge / initials");
 
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->position_combo), "Dial Up");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->position_combo), "Dial Down");

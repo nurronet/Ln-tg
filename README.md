@@ -1,31 +1,29 @@
-# LN Timegrapher Station Overlay v0.1
+# LN TG v0.2.1 Modified Files Overlay
 
-Adds a lightweight LN station layer for the `Ln-tg` fork.
+This zip contains modified/new files only. No patch script.
 
-## What this overlay adds
+## Copy these files into the repo root
 
-- scan-friendly identity field
-- operator field
-- timing position selector
-- JSON export scaffold
-- future ERPNext submit API boundary
-- no dependency on ERPNext at runtime
-- no change to the signal-processing core
-
-## Why this shape
-
-The upstream app is GPL-2.0 and native GTK/C. This overlay keeps LN-specific station behavior isolated so the fork can still track upstream while adding workshop workflow features.
-
-## Files
-
-- `src/ln_station.h`
+- `Makefile.am`
 - `src/ln_station.c`
-- `src/ln_station_panel.h`
+- `src/ln_station.h`
 - `src/ln_station_panel.c`
-- `examples/timing_result_example.json`
-- `patches/INTEGRATION_NOTES.md`
-- `patches/Makefile.am.snippet`
+- `src/ln_station_panel.h`
 
-## Next step
+## Manual edit required
 
-After these files compile in the fork, v0.2 should connect the export call to the place in the code where stable timing values are updated.
+Because `src/interface.c` in this fork is compact/minified, I did not include a blind full-file replacement.
+
+Open:
+
+`src/interface_ln_station_additions.c`
+
+and paste the marked blocks into your existing `src/interface.c`.
+
+## Build
+
+```bash
+./autogen.sh
+./configure
+make
+```

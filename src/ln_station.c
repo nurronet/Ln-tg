@@ -6,7 +6,7 @@
 #include <time.h>
 
 #ifndef LN_STATION_VERSION
-#define LN_STATION_VERSION "0.1.0"
+#define LN_STATION_VERSION "0.2.1"
 #endif
 
 static void safe_copy(char *dst, unsigned long dst_len, const char *src) {
@@ -50,7 +50,7 @@ void ln_station_init(LnStationContext *ctx) {
     memset(ctx, 0, sizeof(*ctx));
     safe_copy(ctx->station_id, sizeof(ctx->station_id), "LN-TG-001");
     safe_copy(ctx->position, sizeof(ctx->position), "Dial Up");
-    safe_copy(ctx->export_dir, sizeof(ctx->export_dir), "ln_exports");
+    safe_copy(ctx->export_dir, sizeof(ctx->export_dir), ".");
     ctx->export_enabled = true;
     ctx->submit_enabled = false;
 }
@@ -72,13 +72,21 @@ void ln_station_set_position(LnStationContext *ctx, const char *position) {
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len) {
     char stamp[32];
+    char safe_identity[160];
     char path[1024];
     FILE *f;
+    unsigned long i;
 
     if (!ctx || !result || !ctx->identity_id[0]) return -1;
 
+    safe_copy(safe_identity, sizeof(safe_identity), ctx->identity_id);
+    for (i = 0; safe_identity[i]; i++) {
+        if (safe_identity[i] == '/' || safe_identity[i] == '\\' || safe_identity[i] == ':' || safe_identity[i] == ' ')
+            safe_identity[i] = '_';
+    }
+
     now_compact(stamp, sizeof(stamp));
-    snprintf(path, sizeof(path), "%s/%s_%s.json", ctx->export_dir[0] ? ctx->export_dir : ".", ctx->identity_id, stamp);
+    snprintf(path, sizeof(path), "%s/%s_%s.json", ctx->export_dir[0] ? ctx->export_dir : ".", safe_identity, stamp);
 
     f = fopen(path, "w");
     if (!f) return -2;
@@ -110,26 +118,12 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
 }
 
 int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len) {
-    /*
-     * Placeholder for v0.2.
-     *
-     * Keep HTTP submission behind this API so the timegrapher remains usable
-     * without ERP connectivity. Recommended implementation:
-     *
-     * 1. Export JSON using ln_station_export_json().
-     * 2. POST JSON to:
-     *    /api/method/ln_watch_inventory.api.timegrapher.submit_timing_result
-     * 3. Authenticate with Frappe token auth:
-     *    Authorization: token <api_key>:<api_secret>
-     *
-     * This file intentionally avoids adding a libcurl dependency in v0.1.
-     */
     (void)result;
     if (!ctx) return -1;
     if (!ctx->submit_enabled) {
         safe_copy(response, response_len, "submit disabled; JSON export only");
         return 1;
     }
-    safe_copy(response, response_len, "submit not implemented in v0.1");
+    safe_copy(response, response_len, "submit not implemented in v0.2.1");
     return 2;
 }

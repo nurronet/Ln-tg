@@ -17,6 +17,8 @@
 */
 
 #include "tg.h"
+#include "ln_station.h"
+#include "ln_station_panel.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -30,6 +32,7 @@ int testing = 0;
 int preset_bph[] = PRESET_BPH;
 static const int available_sample_rates[] = {22050, 32000, 44100, 48000, 96000, 0};
 static const char *available_sample_rate_labels[] = {"22.05 kHz", "32 kHz", "44.1 kHz", "48 kHz", "96 kHz", NULL};
+static LnStationContext ln_ctx;
 
 void print_debug(char *format,...)
 {
@@ -665,6 +668,58 @@ static void save_current(GtkMenuItem *m, struct main_window *w)
 	snapshot_destroy(snapshot);
 }
 
+static void ln_station_timestamp_iso(char *buf, size_t len) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    #if defined(_WIN32)
+        gmtime_s(&tmv, &t);
+    #else
+        gmtime_r(&t, &tmv);
+    #endif
+        strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+}
+
+static void save_ln_timing_json(GtkMenuItem *m, struct main_window *w) {
+    UNUSED(m);
+
+    struct snapshot *snapshot = w->active_snapshot;
+    if (!snapshot || snapshot->calibrate || !snapshot->pb) {
+        error("No stable timing result is available yet.");
+        return;
+    }
+
+    if (!ln_ctx.identity_id[0]) {
+        error("Scan or enter an LN identity before saving timing data.");
+        return;
+    }
+
+    compute_results(snapshot);
+
+    LnTimingResult result;
+    memset(&result, 0, sizeof(result));
+    result.rate_s_per_day = snapshot->rate;
+    result.beat_error_ms = snapshot->be;
+    result.amplitude_deg = snapshot->amp;
+    result.beat_frequency_bph = snapshot->bph ? snapshot->bph : snapshot->guessed_bph;
+    result.lift_angle_deg = snapshot->la;
+    result.sample_rate_hz = snapshot->sample_rate;
+    result.duration_seconds = 0.0;
+    ln_station_timestamp_iso(result.timestamp_iso, sizeof(result.timestamp_iso));
+    snprintf(result.notes, sizeof(result.notes), "Saved from Tg real-time display");
+
+    char out_path[1024];
+    int rc = ln_station_export_json(&ln_ctx, &result, out_path, sizeof(out_path));
+    if (rc) {
+        error("Unable to save LN timing JSON. Code %d", rc);
+        return;
+    }
+
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(w->window), 0, GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+        "LN timing JSON saved:\n%s", out_path);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
 static void close_all(GtkMenuItem *m, struct main_window *w)
 {
 	UNUSED(m);
@@ -787,6 +842,10 @@ static void init_main_window(struct main_window *w)
 
 	GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
 	gtk_container_add(GTK_CONTAINER(w->window), vbox);
+
+	ln_station_init(&ln_ctx);
+	GtkWidget *ln_panel = ln_station_panel_new(&ln_ctx);
+	gtk_box_pack_start(GTK_BOX(vbox), ln_panel, FALSE, FALSE, 0);
 
 	GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
 	gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
@@ -952,6 +1011,11 @@ static void init_main_window(struct main_window *w)
 	gtk_menu_shell_append(GTK_MENU_SHELL(command_menu), w->save_item);
 	g_signal_connect(w->save_item, "activate", G_CALLBACK(save_current), w);
 	gtk_widget_set_sensitive(w->save_item, FALSE);
+
+	// Export Timing Data
+	GtkWidget *ln_save_item = gtk_menu_item_new_with_label("Save LN Timing JSON");
+	gtk_menu_shell_append(GTK_MENU_SHELL(command_menu), ln_save_item);
+	g_signal_connect(ln_save_item, "activate", G_CALLBACK(save_ln_timing_json), w);
 
 	// ... Save all
 	w->save_all_item = gtk_menu_item_new_with_label("Save all snapshots");
