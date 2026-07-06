@@ -1,0 +1,20 @@
+{
+  "schema": "ln_tg_timing_result_v1",
+  "station_version": "0.1.0",
+  "station_id": "LN-TG-BENCH-01",
+  "operator_id": "nick",
+  "identity_id": "LN-SER-00025",
+  "work_order": "LN-MFG-00042",
+  "position": "Dial Up",
+  "timestamp_iso": "2026-07-06T13:30:00Z",
+  "measurements": {
+    "rate_s_per_day": 2.1,
+    "beat_error_ms": 0.1,
+    "amplitude_deg": 302.0,
+    "beat_frequency_bph": 28800,
+    "lift_angle_deg": 52,
+    "sample_rate_hz": 48000,
+    "duration_seconds": 60
+  },
+  "notes": "Example payload from LN Timegrapher Station"
+}
