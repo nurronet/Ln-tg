@@ -33,6 +33,9 @@ int preset_bph[] = PRESET_BPH;
 static const int available_sample_rates[] = {22050, 32000, 44100, 48000, 96000, 0};
 static const char *available_sample_rate_labels[] = {"22.05 kHz", "32 kHz", "44.1 kHz", "48 kHz", "96 kHz", NULL};
 static LnStationContext ln_ctx;
+static GtkWidget *ln_panel_widget = NULL;
+static GtkWidget *ln_sidebar_revealer = NULL;
+static GtkWidget *ln_sidebar_toggle_button = NULL;
 
 void print_debug(char *format,...)
 {
@@ -763,6 +766,43 @@ static void save_all(GtkMenuItem *m, struct main_window *w)
 	fclose(f);
 }
 
+
+static void save_ln_timing_json_button(GtkButton *button, struct main_window *w)
+{
+	UNUSED(button);
+	save_ln_timing_json(NULL, w);
+}
+
+static void complete_ln_session_button(GtkButton *button, struct main_window *w)
+{
+	UNUSED(button);
+	GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(w->window), 0, GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
+			"Timing session marked complete. ERP sync will be added in a future milestone.");
+	gtk_dialog_run(GTK_DIALOG(dialog));
+	gtk_widget_destroy(dialog);
+}
+
+static void next_ln_position_button(GtkButton *button, struct main_window *w)
+{
+	UNUSED(button);
+	UNUSED(w);
+	if(ln_panel_widget)
+		ln_station_panel_advance_position(ln_panel_widget);
+}
+
+static void toggle_ln_sidebar_button(GtkButton *button, struct main_window *w)
+{
+	UNUSED(button);
+	UNUSED(w);
+	if(!ln_sidebar_revealer) return;
+	gboolean reveal = gtk_revealer_get_reveal_child(GTK_REVEALER(ln_sidebar_revealer));
+	gtk_revealer_set_reveal_child(GTK_REVEALER(ln_sidebar_revealer), !reveal);
+	if(ln_sidebar_toggle_button) {
+		gtk_button_set_label(GTK_BUTTON(ln_sidebar_toggle_button), reveal ? "›" : "‹");
+		gtk_widget_set_tooltip_text(ln_sidebar_toggle_button, reveal ? "Show LN data panel" : "Hide LN data panel");
+	}
+}
+
 static void load_snapshots(FILE *f, char *name, struct main_window *w)
 {
 	struct snapshot **s;
@@ -837,15 +877,29 @@ static void init_main_window(struct main_window *w)
 	gtk_container_set_border_width(GTK_CONTAINER(w->window), 10);
 	g_signal_connect(w->window, "delete_event", G_CALLBACK(delete_event), w);
 
-	gtk_window_set_title(GTK_WINDOW(w->window), PROGRAM_NAME " " VERSION);
+	gtk_window_set_title(GTK_WINDOW(w->window), PROGRAM_NAME " " VERSION " - LN Watchmaker Station");
 	gtk_window_set_icon_name (GTK_WINDOW(w->window), PACKAGE);
 
-	GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-	gtk_container_add(GTK_CONTAINER(w->window), vbox);
+	GtkWidget *root_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+	gtk_container_add(GTK_CONTAINER(w->window), root_box);
 
 	ln_station_init(&ln_ctx);
 	GtkWidget *ln_panel = ln_station_panel_new(&ln_ctx);
-	gtk_box_pack_start(GTK_BOX(vbox), ln_panel, FALSE, FALSE, 0);
+	ln_panel_widget = ln_panel;
+	ln_sidebar_revealer = gtk_revealer_new();
+	gtk_revealer_set_transition_type(GTK_REVEALER(ln_sidebar_revealer), GTK_REVEALER_TRANSITION_TYPE_SLIDE_LEFT);
+	gtk_revealer_set_reveal_child(GTK_REVEALER(ln_sidebar_revealer), TRUE);
+	gtk_container_add(GTK_CONTAINER(ln_sidebar_revealer), ln_panel);
+	gtk_box_pack_start(GTK_BOX(root_box), ln_sidebar_revealer, FALSE, FALSE, 0);
+
+	ln_sidebar_toggle_button = gtk_button_new_with_label("‹");
+	gtk_widget_set_tooltip_text(ln_sidebar_toggle_button, "Hide LN data panel");
+	gtk_box_pack_start(GTK_BOX(root_box), ln_sidebar_toggle_button, FALSE, FALSE, 2);
+	g_signal_connect(ln_sidebar_toggle_button, "clicked", G_CALLBACK(toggle_ln_sidebar_button), w);
+	ln_station_panel_bind_sidebar_toggle(ln_panel, G_CALLBACK(toggle_ln_sidebar_button), w);
+
+	GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+	gtk_box_pack_start(GTK_BOX(root_box), vbox, TRUE, TRUE, 0);
 
 	GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
 	gtk_box_pack_start(GTK_BOX(vbox), hbox, FALSE, FALSE, 0);
@@ -965,6 +1019,21 @@ static void init_main_window(struct main_window *w)
 	g_signal_connect(w->cal_spin_button, "output", G_CALLBACK(output_cal), NULL);
 	g_signal_connect(w->cal_spin_button, "input", G_CALLBACK(input_cal), NULL);
 
+	GtkWidget *ln_top_save_button = gtk_button_new_with_label("▣");
+	gtk_widget_set_tooltip_text(ln_top_save_button, "Save Reading");
+	gtk_box_pack_start(GTK_BOX(hbox), ln_top_save_button, FALSE, FALSE, 0);
+	g_signal_connect(ln_top_save_button, "clicked", G_CALLBACK(save_ln_timing_json_button), w);
+
+	GtkWidget *ln_top_next_button = gtk_button_new_with_label("→");
+	gtk_widget_set_tooltip_text(ln_top_next_button, "Next Position");
+	gtk_box_pack_start(GTK_BOX(hbox), ln_top_next_button, FALSE, FALSE, 0);
+	g_signal_connect(ln_top_next_button, "clicked", G_CALLBACK(next_ln_position_button), w);
+
+	GtkWidget *ln_top_complete_button = gtk_button_new_with_label("⚑");
+	gtk_widget_set_tooltip_text(ln_top_complete_button, "Complete Session");
+	gtk_box_pack_start(GTK_BOX(hbox), ln_top_complete_button, FALSE, FALSE, 0);
+	g_signal_connect(ln_top_complete_button, "clicked", G_CALLBACK(complete_ln_session_button), w);
+
 	// Is there a more elegant way?
 	GtkWidget *empty = gtk_label_new("");
 	gtk_box_pack_start(GTK_BOX(hbox), empty, TRUE, FALSE, 0);
@@ -1043,6 +1112,8 @@ static void init_main_window(struct main_window *w)
 	gtk_menu_shell_append(GTK_MENU_SHELL(command_menu), w->close_all_item);
 	g_signal_connect(w->close_all_item, "activate", G_CALLBACK(close_all), w);
 	gtk_widget_set_sensitive(w->close_all_item, FALSE);
+
+	ln_station_panel_bind_actions(ln_panel, G_CALLBACK(save_ln_timing_json_button), NULL, G_CALLBACK(complete_ln_session_button), w);
 
 	// ... Quit
 	GtkWidget *quit_item = gtk_menu_item_new_with_label("Quit");

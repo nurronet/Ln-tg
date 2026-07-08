@@ -37,6 +37,13 @@ void ln_station_init(LnStationContext *ctx);
 void ln_station_set_identity(LnStationContext *ctx, const char *identity_id);
 void ln_station_set_operator(LnStationContext *ctx, const char *operator_id);
 void ln_station_set_position(LnStationContext *ctx, const char *position);
+const char *ln_station_current_position(void);
+void ln_station_set_qa_standard(const char *standard);
+const char *ln_station_current_qa_standard(void);
+int ln_station_current_qa_rate_limit(void);
+void ln_station_qa_update_rate(double rate_s_per_day, int valid);
+int ln_station_position_qa_passed(void);
+double ln_station_position_qa_seconds(void);
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len);
 int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len);

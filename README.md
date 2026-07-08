@@ -1,28 +1,40 @@
-# LN TG v0.2.1 Modified Files Overlay
+# LNWS Milestone 0.7 QA Standard Checkmark
 
-This zip contains modified/new files only. No patch script.
+Adds selectable timing QA standards and a live pass indicator in the main data bar.
 
-## Copy these files into the repo root
+## QA standards
 
-- `Makefile.am`
+- Standard: +/- 20 s/day
+- Enhanced: +/- 10 s/day
+- Top: +/- 5 s/day
+- Chrono: +/- 2 s/day
+
+After the current position remains within the selected rate tolerance for 5 continuous seconds, the data bar shows a green checkmark after the position.
+
+Example:
+
+```text
+25200 bph  pos Dial Up ✓
+```
+
+Before the 5-second pass is achieved, the data bar shows the selected rate tolerance:
+
+```text
+25200 bph  pos Dial Up +/-20s
+```
+
+## Files changed
+
+- `src/output_panel.c`
 - `src/ln_station.c`
 - `src/ln_station.h`
 - `src/ln_station_panel.c`
 - `src/ln_station_panel.h`
 
-## Manual edit required
-
-Because `src/interface.c` in this fork is compact/minified, I did not include a blind full-file replacement.
-
-Open:
-
-`src/interface_ln_station_additions.c`
-
-and paste the marked blocks into your existing `src/interface.c`.
-
 ## Build
 
 ```bash
+make clean
 ./autogen.sh
 ./configure
 make

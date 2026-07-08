@@ -250,6 +250,7 @@ struct main_window {
 	GtkWidget *snapshot_button;
 	GtkWidget *snapshot_name;
 	GtkWidget *snapshot_name_entry;
+	GtkWidget *ln_station_panel;
 	GtkWidget *cal_button;
 	GtkWidget *notebook;
 	GtkWidget *save_item;

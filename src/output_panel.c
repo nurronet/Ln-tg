@@ -17,6 +17,7 @@
 */
 
 #include "tg.h"
+#include "ln_station.h"
 
 cairo_pattern_t *black,*white,*red,*green,*blue,*blueish,*yellow,*goldenrod;
 
@@ -285,6 +286,35 @@ static gboolean output_draw_event(GtkWidget *widget, cairo_t *c, struct output_p
 				cairo_set_source(c, i > 4 || !p || !old ? white : yellow);
 				cairo_set_font_size(c, OUTPUT_FONT);
 				x = print_number(c,x,y,outputs[i]);
+			}
+		}
+
+		/* LNWS: show the current tested position and QA status directly after BPH. */
+		{
+			const char *position = ln_station_current_position();
+			int valid_rate = p && old;
+			if(valid_rate)
+				ln_station_qa_update_rate(snst->rate, 1);
+			else
+				ln_station_qa_update_rate(0, 0);
+
+			if(position && *position) {
+				char qa_buf[48];
+				cairo_set_source(c, white);
+				cairo_set_font_size(c, OUTPUT_FONT*2/3);
+				x = print_s(c, x + 18, y, " pos ");
+				cairo_set_source(c, goldenrod);
+				cairo_set_font_size(c, OUTPUT_FONT*2/3);
+				x = print_s(c, x, y, (char *)position);
+
+				if(ln_station_position_qa_passed()) {
+					cairo_set_source(c, green);
+					x = print_s(c, x + 10, y, " ✓");
+				} else {
+					snprintf(qa_buf, sizeof(qa_buf), " ±%ds", ln_station_current_qa_rate_limit());
+					cairo_set_source(c, white);
+					x = print_s(c, x + 10, y, qa_buf);
+				}
 			}
 		}
 	}

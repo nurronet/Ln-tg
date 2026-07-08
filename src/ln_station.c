@@ -6,8 +6,14 @@
 #include <time.h>
 
 #ifndef LN_STATION_VERSION
-#define LN_STATION_VERSION "0.2.1"
+#define LN_STATION_VERSION "0.7.0"
 #endif
+
+static char ln_station_global_position[32] = "Dial Up";
+static char ln_station_global_qa_standard[32] = "Standard";
+static int ln_station_global_qa_limit = 20;
+static time_t ln_station_qa_started_at = 0;
+static int ln_station_qa_passed = 0;
 
 static void safe_copy(char *dst, unsigned long dst_len, const char *src) {
     if (!dst || dst_len == 0) return;
@@ -50,7 +56,9 @@ void ln_station_init(LnStationContext *ctx) {
     memset(ctx, 0, sizeof(*ctx));
     safe_copy(ctx->station_id, sizeof(ctx->station_id), "LN-TG-001");
     safe_copy(ctx->position, sizeof(ctx->position), "Dial Up");
+    safe_copy(ln_station_global_position, sizeof(ln_station_global_position), ctx->position);
     safe_copy(ctx->export_dir, sizeof(ctx->export_dir), ".");
+    ln_station_set_qa_standard("Standard");
     ctx->export_enabled = true;
     ctx->submit_enabled = false;
 }
@@ -68,6 +76,66 @@ void ln_station_set_operator(LnStationContext *ctx, const char *operator_id) {
 void ln_station_set_position(LnStationContext *ctx, const char *position) {
     if (!ctx) return;
     safe_copy(ctx->position, sizeof(ctx->position), position);
+    safe_copy(ln_station_global_position, sizeof(ln_station_global_position), ctx->position);
+    ln_station_qa_started_at = 0;
+    ln_station_qa_passed = 0;
+}
+
+const char *ln_station_current_position(void) {
+    return ln_station_global_position[0] ? ln_station_global_position : "Dial Up";
+}
+
+void ln_station_set_qa_standard(const char *standard) {
+    if (!standard || !*standard) standard = "Standard";
+
+    safe_copy(ln_station_global_qa_standard, sizeof(ln_station_global_qa_standard), standard);
+
+    if (strcmp(standard, "Chrono") == 0 || strcmp(standard, "Chronometer") == 0)
+        ln_station_global_qa_limit = 2;
+    else if (strcmp(standard, "Top") == 0)
+        ln_station_global_qa_limit = 5;
+    else if (strcmp(standard, "Enhanced") == 0)
+        ln_station_global_qa_limit = 10;
+    else
+        ln_station_global_qa_limit = 20;
+
+    ln_station_qa_started_at = 0;
+    ln_station_qa_passed = 0;
+}
+
+const char *ln_station_current_qa_standard(void) {
+    return ln_station_global_qa_standard[0] ? ln_station_global_qa_standard : "Standard";
+}
+
+int ln_station_current_qa_rate_limit(void) {
+    return ln_station_global_qa_limit;
+}
+
+void ln_station_qa_update_rate(double rate_s_per_day, int valid) {
+    double abs_rate = rate_s_per_day < 0 ? -rate_s_per_day : rate_s_per_day;
+    time_t now_t = time(NULL);
+
+    if (!valid || abs_rate > (double)ln_station_global_qa_limit) {
+        ln_station_qa_started_at = 0;
+        ln_station_qa_passed = 0;
+        return;
+    }
+
+    if (!ln_station_qa_started_at)
+        ln_station_qa_started_at = now_t;
+
+    if (difftime(now_t, ln_station_qa_started_at) >= 5.0)
+        ln_station_qa_passed = 1;
+}
+
+int ln_station_position_qa_passed(void) {
+    return ln_station_qa_passed;
+}
+
+double ln_station_position_qa_seconds(void) {
+    if (!ln_station_qa_started_at)
+        return 0.0;
+    return difftime(time(NULL), ln_station_qa_started_at);
 }
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len) {
