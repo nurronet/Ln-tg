@@ -19,6 +19,8 @@ typedef struct {
     GtkWidget *operator_entry;
     GtkWidget *position_combo;
     GtkWidget *qa_standard_combo;
+    GtkWidget *temperature_combo;
+    GtkWidget *measurement_type_combo;
     GtkWidget *status_label;
     GtkWidget *position_rows[LN_POSITION_COUNT];
     GtkWidget *position_status[LN_POSITION_COUNT];
@@ -139,6 +141,26 @@ static void on_position_changed(GtkComboBoxText *combo, gpointer user_data) {
 }
 
 
+static void on_temperature_changed(GtkComboBoxText *combo, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    gchar *text = gtk_combo_box_text_get_active_text(combo);
+    if (text) {
+        ln_station_set_temperature_condition(text);
+        g_free(text);
+    }
+    gtk_label_set_text(GTK_LABEL(panel->status_label), "Temperature condition updated.");
+}
+
+static void on_measurement_type_changed(GtkComboBoxText *combo, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    gchar *text = gtk_combo_box_text_get_active_text(combo);
+    if (text) {
+        ln_station_set_measurement_type(text);
+        g_free(text);
+    }
+    gtk_label_set_text(GTK_LABEL(panel->status_label), ln_station_is_followup() ? "Follow-up mode enabled; baseline comparison active when ERP data is available." : "Initial measurement mode.");
+}
+
 static void on_qa_standard_changed(GtkComboBoxText *combo, gpointer user_data) {
     LnStationPanel *panel = (LnStationPanel *)user_data;
     gchar *text = gtk_combo_box_text_get_active_text(combo);
@@ -206,6 +228,8 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     panel->operator_entry = gtk_entry_new();
     panel->position_combo = gtk_combo_box_text_new();
     panel->qa_standard_combo = gtk_combo_box_text_new();
+    panel->temperature_combo = gtk_combo_box_text_new();
+    panel->measurement_type_combo = gtk_combo_box_text_new();
 
     gtk_entry_set_placeholder_text(GTK_ENTRY(panel->identity_entry), "LN-SER-00025 / watch serial");
     gtk_entry_set_placeholder_text(GTK_ENTRY(panel->work_order_entry), "LN-MFG-00042 / optional");
@@ -215,17 +239,31 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
         gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->position_combo), LN_POSITIONS[i]);
     gtk_combo_box_set_active(GTK_COMBO_BOX(panel->position_combo), 0);
 
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Standard");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Enhanced");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Top");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Chrono");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Workshop");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Precision");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Signature");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), "Observatory");
     gtk_combo_box_set_active(GTK_COMBO_BOX(panel->qa_standard_combo), 0);
+
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->temperature_combo), "Room / 23C");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->temperature_combo), "Cold / 8C");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->temperature_combo), "Warm / 38C");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->temperature_combo), "Custom");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(panel->temperature_combo), 0);
+
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Initial Certification");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Follow-up Certification");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Service Check");
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Regulation Check");
+    gtk_combo_box_set_active(GTK_COMBO_BOX(panel->measurement_type_combo), 0);
 
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Watch / Serial", panel->identity_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Work Order", panel->work_order_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Operator", panel->operator_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Position", panel->position_combo), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("QA Standard", panel->qa_standard_combo), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Temperature", panel->temperature_combo), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Measurement", panel->measurement_type_combo), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), identity_card, FALSE, FALSE, 0);
 
     GtkWidget *session_card = make_card("▣  SESSION");
@@ -315,6 +353,8 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     g_signal_connect(panel->operator_entry, "changed", G_CALLBACK(on_operator_changed), panel);
     g_signal_connect(panel->position_combo, "changed", G_CALLBACK(on_position_changed), panel);
     g_signal_connect(panel->qa_standard_combo, "changed", G_CALLBACK(on_qa_standard_changed), panel);
+    g_signal_connect(panel->temperature_combo, "changed", G_CALLBACK(on_temperature_changed), panel);
+    g_signal_connect(panel->measurement_type_combo, "changed", G_CALLBACK(on_measurement_type_changed), panel);
     g_signal_connect(panel->next_button, "clicked", G_CALLBACK(on_next_position), root);
     g_signal_connect(panel->data_entry_toggle, "clicked", G_CALLBACK(on_toggle_data_entry), panel);
 

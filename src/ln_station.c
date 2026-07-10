@@ -6,12 +6,25 @@
 #include <time.h>
 
 #ifndef LN_STATION_VERSION
-#define LN_STATION_VERSION "0.7.0"
+#define LN_STATION_VERSION "0.8.0"
 #endif
 
 static char ln_station_global_position[32] = "Dial Up";
-static char ln_station_global_qa_standard[32] = "Standard";
+static char ln_station_global_qa_standard[32] = "Workshop";
+static char ln_station_global_temperature_condition[32] = "Room / 23C";
+static char ln_station_global_measurement_type[48] = "Initial Certification";
+static int ln_station_global_followup_mode = 0;
 static int ln_station_global_qa_limit = 20;
+
+typedef struct {
+    char position[32];
+    double rate_s_per_day;
+    double beat_error_ms;
+    double amplitude_deg;
+    int has_value;
+} LnStationBaseline;
+
+static LnStationBaseline ln_station_baselines[6];
 static time_t ln_station_qa_started_at = 0;
 static int ln_station_qa_passed = 0;
 
@@ -56,9 +69,15 @@ void ln_station_init(LnStationContext *ctx) {
     memset(ctx, 0, sizeof(*ctx));
     safe_copy(ctx->station_id, sizeof(ctx->station_id), "LN-TG-001");
     safe_copy(ctx->position, sizeof(ctx->position), "Dial Up");
+    safe_copy(ctx->qa_standard, sizeof(ctx->qa_standard), "Workshop");
+    safe_copy(ctx->temperature_condition, sizeof(ctx->temperature_condition), "Room / 23C");
+    safe_copy(ctx->measurement_type, sizeof(ctx->measurement_type), "Initial Certification");
+    ctx->followup_mode = false;
     safe_copy(ln_station_global_position, sizeof(ln_station_global_position), ctx->position);
     safe_copy(ctx->export_dir, sizeof(ctx->export_dir), ".");
-    ln_station_set_qa_standard("Standard");
+    ln_station_set_qa_standard("Workshop");
+    ln_station_set_temperature_condition("Room / 23C");
+    ln_station_set_measurement_type("Initial Certification");
     ctx->export_enabled = true;
     ctx->submit_enabled = false;
 }
@@ -86,15 +105,15 @@ const char *ln_station_current_position(void) {
 }
 
 void ln_station_set_qa_standard(const char *standard) {
-    if (!standard || !*standard) standard = "Standard";
+    if (!standard || !*standard) standard = "Workshop";
 
     safe_copy(ln_station_global_qa_standard, sizeof(ln_station_global_qa_standard), standard);
 
-    if (strcmp(standard, "Chrono") == 0 || strcmp(standard, "Chronometer") == 0)
+    if (strcmp(standard, "Observatory") == 0)
         ln_station_global_qa_limit = 2;
-    else if (strcmp(standard, "Top") == 0)
+    else if (strcmp(standard, "Signature") == 0)
         ln_station_global_qa_limit = 5;
-    else if (strcmp(standard, "Enhanced") == 0)
+    else if (strcmp(standard, "Precision") == 0)
         ln_station_global_qa_limit = 10;
     else
         ln_station_global_qa_limit = 20;
@@ -104,7 +123,63 @@ void ln_station_set_qa_standard(const char *standard) {
 }
 
 const char *ln_station_current_qa_standard(void) {
-    return ln_station_global_qa_standard[0] ? ln_station_global_qa_standard : "Standard";
+    return ln_station_global_qa_standard[0] ? ln_station_global_qa_standard : "Workshop";
+}
+
+void ln_station_set_temperature_condition(const char *temperature_condition) {
+    safe_copy(ln_station_global_temperature_condition, sizeof(ln_station_global_temperature_condition),
+              temperature_condition && *temperature_condition ? temperature_condition : "Room / 23C");
+}
+
+const char *ln_station_current_temperature_condition(void) {
+    return ln_station_global_temperature_condition[0] ? ln_station_global_temperature_condition : "Room / 23C";
+}
+
+void ln_station_set_measurement_type(const char *measurement_type) {
+    safe_copy(ln_station_global_measurement_type, sizeof(ln_station_global_measurement_type),
+              measurement_type && *measurement_type ? measurement_type : "Initial Certification");
+    ln_station_set_followup_mode(strcmp(ln_station_global_measurement_type, "Follow-up Certification") == 0);
+}
+
+const char *ln_station_current_measurement_type(void) {
+    return ln_station_global_measurement_type[0] ? ln_station_global_measurement_type : "Initial Certification";
+}
+
+void ln_station_set_followup_mode(int followup_mode) {
+    ln_station_global_followup_mode = followup_mode ? 1 : 0;
+}
+
+int ln_station_is_followup(void) {
+    return ln_station_global_followup_mode;
+}
+
+void ln_station_set_baseline_for_position(const char *position, double rate_s_per_day, double beat_error_ms, double amplitude_deg) {
+    int i;
+    if (!position || !*position) return;
+    for (i = 0; i < 6; i++) {
+        if (!ln_station_baselines[i].has_value || strcmp(ln_station_baselines[i].position, position) == 0) {
+            safe_copy(ln_station_baselines[i].position, sizeof(ln_station_baselines[i].position), position);
+            ln_station_baselines[i].rate_s_per_day = rate_s_per_day;
+            ln_station_baselines[i].beat_error_ms = beat_error_ms;
+            ln_station_baselines[i].amplitude_deg = amplitude_deg;
+            ln_station_baselines[i].has_value = 1;
+            return;
+        }
+    }
+}
+
+int ln_station_get_baseline_for_current_position(double *rate_s_per_day, double *beat_error_ms, double *amplitude_deg) {
+    int i;
+    const char *position = ln_station_current_position();
+    for (i = 0; i < 6; i++) {
+        if (ln_station_baselines[i].has_value && strcmp(ln_station_baselines[i].position, position) == 0) {
+            if (rate_s_per_day) *rate_s_per_day = ln_station_baselines[i].rate_s_per_day;
+            if (beat_error_ms) *beat_error_ms = ln_station_baselines[i].beat_error_ms;
+            if (amplitude_deg) *amplitude_deg = ln_station_baselines[i].amplitude_deg;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 int ln_station_current_qa_rate_limit(void) {
@@ -167,6 +242,11 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     fprintf(f, "  \"identity_id\": "); json_escape(f, ctx->identity_id); fprintf(f, ",\n");
     fprintf(f, "  \"work_order\": "); json_escape(f, ctx->work_order); fprintf(f, ",\n");
     fprintf(f, "  \"position\": "); json_escape(f, ctx->position); fprintf(f, ",\n");
+    fprintf(f, "  \"qa_standard\": "); json_escape(f, ln_station_current_qa_standard()); fprintf(f, ",\n");
+    fprintf(f, "  \"qa_rate_limit_s_per_day\": %d,\n", ln_station_current_qa_rate_limit());
+    fprintf(f, "  \"temperature_condition\": "); json_escape(f, ln_station_current_temperature_condition()); fprintf(f, ",\n");
+    fprintf(f, "  \"measurement_type\": "); json_escape(f, ln_station_current_measurement_type()); fprintf(f, ",\n");
+    fprintf(f, "  \"followup_mode\": %s,\n", ln_station_is_followup() ? "true" : "false");
     fprintf(f, "  \"timestamp_iso\": "); json_escape(f, result->timestamp_iso); fprintf(f, ",\n");
     fprintf(f, "  \"measurements\": {\n");
     fprintf(f, "    \"rate_s_per_day\": %.6f,\n", result->rate_s_per_day);
@@ -176,6 +256,12 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     fprintf(f, "    \"lift_angle_deg\": %.6f,\n", result->lift_angle_deg);
     fprintf(f, "    \"sample_rate_hz\": %.6f,\n", result->sample_rate_hz);
     fprintf(f, "    \"duration_seconds\": %.6f\n", result->duration_seconds);
+    fprintf(f, "  },\n");
+    fprintf(f, "  \"baseline\": {\n");
+    fprintf(f, "    \"has_baseline\": %s,\n", result->has_baseline ? "true" : "false");
+    fprintf(f, "    \"rate_s_per_day\": %.6f,\n", result->baseline_rate_s_per_day);
+    fprintf(f, "    \"beat_error_ms\": %.6f,\n", result->baseline_beat_error_ms);
+    fprintf(f, "    \"amplitude_deg\": %.6f\n", result->baseline_amplitude_deg);
     fprintf(f, "  },\n");
     fprintf(f, "  \"notes\": "); json_escape(f, result->notes); fprintf(f, "\n");
     fprintf(f, "}\n");

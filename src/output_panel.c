@@ -315,6 +315,18 @@ static gboolean output_draw_event(GtkWidget *widget, cairo_t *c, struct output_p
 					cairo_set_source(c, white);
 					x = print_s(c, x + 10, y, qa_buf);
 				}
+
+				if(ln_station_is_followup()) {
+					double base_rate = 0, base_be = 0, base_amp = 0;
+					if(ln_station_get_baseline_for_current_position(&base_rate, &base_be, &base_amp)) {
+						snprintf(qa_buf, sizeof(qa_buf), " Δ%+.1f", snst->rate - base_rate);
+						cairo_set_source(c, goldenrod);
+						x = print_s(c, x + 10, y, qa_buf);
+					} else {
+						cairo_set_source(c, goldenrod);
+						x = print_s(c, x + 10, y, " follow-up");
+					}
+				}
 			}
 		}
 	}

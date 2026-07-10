@@ -1,35 +1,58 @@
-# LNWS Milestone 0.7 QA Standard Checkmark
+# LNWS Milestone 0.8 Certification Profiles + Follow-up Context
 
-Adds selectable timing QA standards and a live pass indicator in the main data bar.
+Adds certification-oriented timing context.
 
-## QA standards
+## QA profiles
 
-- Standard: +/- 20 s/day
-- Enhanced: +/- 10 s/day
-- Top: +/- 5 s/day
-- Chrono: +/- 2 s/day
+- Workshop: +/- 20 s/day
+- Precision: +/- 10 s/day
+- Signature: +/- 5 s/day
+- Observatory: +/- 2 s/day
 
-After the current position remains within the selected rate tolerance for 5 continuous seconds, the data bar shows a green checkmark after the position.
+## Temperature condition selector
 
-Example:
+- Room / 23C
+- Cold / 8C
+- Warm / 38C
+- Custom
+
+This aligns the workflow with COSC-style multi-temperature logging without claiming COSC certification.
+
+## Measurement type selector
+
+- Initial Certification
+- Follow-up Certification
+- Service Check
+- Regulation Check
+
+Follow-up mode is now represented in station state and JSON export.
+
+## Baseline comparison scaffolding
+
+The station can store baseline readings per position and compare follow-up readings against the original result. For now, baseline data is a local API placeholder; the next milestone should populate it from ERP when an identity is scanned.
+
+## Data bar
+
+The data bar still shows:
 
 ```text
-25200 bph  pos Dial Up ✓
+25200 bph  pos Dial Up check
 ```
 
-Before the 5-second pass is achieved, the data bar shows the selected rate tolerance:
+In follow-up mode, if a baseline is present, it also shows rate delta:
 
 ```text
-25200 bph  pos Dial Up +/-20s
+25200 bph  pos Dial Up check d+1.2
 ```
 
-## Files changed
+## JSON export additions
 
-- `src/output_panel.c`
-- `src/ln_station.c`
-- `src/ln_station.h`
-- `src/ln_station_panel.c`
-- `src/ln_station_panel.h`
+- qa_standard
+- qa_rate_limit_s_per_day
+- temperature_condition
+- measurement_type
+- followup_mode
+- baseline
 
 ## Build
 
