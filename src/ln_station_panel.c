@@ -1,4 +1,5 @@
 #include "ln_station_panel.h"
+#include "ln_erp_config.h"
 
 #define LN_POSITION_COUNT 6
 
@@ -15,6 +16,14 @@ typedef struct {
     LnStationContext *ctx;
     GtkWidget *root;
     GtkWidget *identity_entry;
+    GtkEntryCompletion *identity_completion;
+    GtkListStore *identity_store;
+    GtkWidget *movement_serial_entry;
+    GtkWidget *movement_part_entry;
+    GtkWidget *watch_unit_entry;
+    GtkWidget *identity_status_entry;
+    guint identity_search_timer;
+    int suppress_identity_change;
     GtkWidget *work_order_entry;
     GtkWidget *operator_entry;
     GtkWidget *position_combo;
@@ -29,6 +38,9 @@ typedef struct {
     GtkWidget *save_button;
     GtkWidget *next_button;
     GtkWidget *complete_button;
+    GtkWidget *erp_button;
+    GtkWidget *bench_label;
+    LnErpConfig erp_config;
     unsigned int completed_mask;
 } LnStationPanel;
 
@@ -106,15 +118,248 @@ static void refresh_position_rows(LnStationPanel *panel) {
     }
 }
 
+
+static void update_erp_status(LnStationPanel *panel) {
+    char bench_text[128];
+    if (!panel) return;
+    g_snprintf(bench_text, sizeof(bench_text), "●  %s%s",
+               panel->erp_config.station_id[0] ? panel->erp_config.station_id : "Bench 01",
+               panel->erp_config.enabled ? "  ·  ERP LINKED" : "  ·  LOCAL");
+    gtk_label_set_text(GTK_LABEL(panel->bench_label), bench_text);
+}
+
+static void on_erp_settings(GtkButton *button, gpointer user_data) {
+    (void)button;
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    GtkWidget *toplevel;
+    char status[512] = {0};
+    if (!panel) return;
+
+    toplevel = gtk_widget_get_toplevel(panel->root);
+    if (ln_erp_config_dialog_run(GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL,
+                                 &panel->erp_config, status, sizeof(status))) {
+        ln_erp_config_apply_to_station(&panel->erp_config, panel->ctx);
+        update_erp_status(panel);
+        gtk_label_set_text(GTK_LABEL(panel->status_label),
+                           panel->erp_config.enabled ? "ERP connection saved and synchronization enabled." : "ERP connection saved; synchronization disabled.");
+    } else if (status[0]) {
+        gtk_label_set_text(GTK_LABEL(panel->status_label), status);
+    }
+}
+
+
+static char *json_unescape_copy(const char *start, size_t length) {
+    GString *out = g_string_sized_new(length + 1);
+    size_t i;
+    for (i = 0; i < length; i++) {
+        if (start[i] == '\\' && i + 1 < length) {
+            i++;
+            switch (start[i]) {
+                case 'n': g_string_append_c(out, '\n'); break;
+                case 'r': g_string_append_c(out, '\r'); break;
+                case 't': g_string_append_c(out, '\t'); break;
+                case '"': g_string_append_c(out, '"'); break;
+                case '\\': g_string_append_c(out, '\\'); break;
+                default: g_string_append_c(out, start[i]); break;
+            }
+        } else {
+            g_string_append_c(out, start[i]);
+        }
+    }
+    return g_string_free(out, FALSE);
+}
+
+static char *json_string_value(const char *json, const char *key) {
+    char pattern[128];
+    GRegex *regex;
+    GMatchInfo *match = NULL;
+    char *value = NULL;
+    g_snprintf(pattern, sizeof(pattern), "\\\"%s\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"", key);
+    regex = g_regex_new(pattern, G_REGEX_DOTALL, 0, NULL);
+    if (regex && g_regex_match(regex, json ? json : "", 0, &match)) {
+        gchar *raw = g_match_info_fetch(match, 1);
+        value = json_unescape_copy(raw, strlen(raw));
+        g_free(raw);
+    }
+    if (match) g_match_info_free(match);
+    if (regex) g_regex_unref(regex);
+    return value;
+}
+
+static void combo_set_active_text(GtkComboBoxText *combo, const char *text) {
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    int index = 0;
+    if (!combo || !text || !*text) return;
+    model = gtk_combo_box_get_model(GTK_COMBO_BOX(combo));
+    if (!model || !gtk_tree_model_get_iter_first(model, &iter)) return;
+    do {
+        gchar *value = NULL;
+        gtk_tree_model_get(model, &iter, 0, &value, -1);
+        if (value && g_strcmp0(value, text) == 0) {
+            gtk_combo_box_set_active(GTK_COMBO_BOX(combo), index);
+            g_free(value);
+            return;
+        }
+        g_free(value);
+        index++;
+    } while (gtk_tree_model_iter_next(model, &iter));
+}
+
+static void set_readonly_entry(GtkWidget *entry, const char *value) {
+    if (entry) gtk_entry_set_text(GTK_ENTRY(entry), value ? value : "");
+}
+
+static void populate_identity_from_json(LnStationPanel *panel, const char *json) {
+    char *found = NULL;
+    char *identity_id = json_string_value(json, "identity_id");
+    char *movement_serial = json_string_value(json, "movement_serial");
+    char *manufacturer_serial = json_string_value(json, "manufacturer_serial");
+    char *ln_part = json_string_value(json, "ln_part");
+    char *item = json_string_value(json, "item");
+    char *watch_unit = json_string_value(json, "current_watch_unit");
+    char *work_order = json_string_value(json, "current_work_order");
+    char *status = json_string_value(json, "lifecycle_status");
+    char *grade = json_string_value(json, "functional_grade");
+    char *qa = json_string_value(json, "qa_status");
+    char *measurement = json_string_value(json, "recommended_measurement_type");
+    char *profile = json_string_value(json, "recommended_profile");
+    char status_text[256];
+
+    (void)found;
+    if (!identity_id) {
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "Identity not found in ERP.");
+        goto cleanup;
+    }
+
+    panel->suppress_identity_change = 1;
+    gtk_entry_set_text(GTK_ENTRY(panel->identity_entry), identity_id);
+    panel->suppress_identity_change = 0;
+    ln_station_set_identity(panel->ctx, identity_id);
+
+    set_readonly_entry(panel->movement_serial_entry,
+                       movement_serial && *movement_serial ? movement_serial : manufacturer_serial);
+    set_readonly_entry(panel->movement_part_entry,
+                       ln_part && *ln_part ? ln_part : item);
+    set_readonly_entry(panel->watch_unit_entry, watch_unit);
+    set_readonly_entry(panel->work_order_entry, work_order);
+    snprintf(panel->ctx->work_order, sizeof(panel->ctx->work_order), "%s", work_order ? work_order : "");
+
+    g_snprintf(status_text, sizeof(status_text), "%s%s%s%s%s",
+               status ? status : "",
+               status && grade ? "  ·  " : "",
+               grade ? grade : "",
+               (status || grade) && qa ? "  ·  " : "",
+               qa ? qa : "");
+    set_readonly_entry(panel->identity_status_entry, status_text);
+
+    combo_set_active_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), measurement);
+    combo_set_active_text(GTK_COMBO_BOX_TEXT(panel->qa_standard_combo), profile);
+    gtk_label_set_text(GTK_LABEL(panel->status_label), "ERP identity selected and movement data loaded.");
+
+cleanup:
+    g_free(identity_id); g_free(movement_serial); g_free(manufacturer_serial);
+    g_free(ln_part); g_free(item); g_free(watch_unit); g_free(work_order);
+    g_free(status); g_free(grade); g_free(qa); g_free(measurement); g_free(profile);
+}
+
+static void lookup_identity_now(LnStationPanel *panel, const char *identity) {
+    char response[16384];
+    int rc;
+    if (!panel || !identity || !*identity || !panel->erp_config.enabled) return;
+    gtk_label_set_text(GTK_LABEL(panel->status_label), "Looking up identity in ERP...");
+    rc = ln_erp_identity_lookup(&panel->erp_config, identity, response, sizeof(response));
+    if (rc == 0)
+        populate_identity_from_json(panel, response);
+    else {
+        char message[512];
+        g_snprintf(message, sizeof(message), "ERP identity lookup failed (%d).", rc);
+        gtk_label_set_text(GTK_LABEL(panel->status_label), message);
+    }
+}
+
+static void update_identity_suggestions(LnStationPanel *panel, const char *json) {
+    GRegex *regex;
+    GMatchInfo *match = NULL;
+    if (!panel || !panel->identity_store) return;
+    gtk_list_store_clear(panel->identity_store);
+
+    regex = g_regex_new("\\{[^{}]*\\\"identity_id\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"[^{}]*\\\"display\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"[^{}]*\\}", G_REGEX_DOTALL, 0, NULL);
+    if (!regex) return;
+    g_regex_match(regex, json ? json : "", 0, &match);
+    while (match && g_match_info_matches(match)) {
+        gchar *raw_id = g_match_info_fetch(match, 1);
+        gchar *raw_display = g_match_info_fetch(match, 2);
+        char *identity_id = json_unescape_copy(raw_id, strlen(raw_id));
+        char *display = json_unescape_copy(raw_display, strlen(raw_display));
+        GtkTreeIter iter;
+        gtk_list_store_append(panel->identity_store, &iter);
+        gtk_list_store_set(panel->identity_store, &iter, 0, display, 1, identity_id, -1);
+        g_free(raw_id); g_free(raw_display); g_free(identity_id); g_free(display);
+        if (!g_match_info_next(match, NULL)) break;
+    }
+    if (match) g_match_info_free(match);
+    g_regex_unref(regex);
+}
+
+static gboolean identity_search_timeout(gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    const char *text;
+    char response[32768];
+    panel->identity_search_timer = 0;
+    if (!panel || !panel->erp_config.enabled || !panel->erp_config.auto_lookup) return G_SOURCE_REMOVE;
+    text = gtk_entry_get_text(GTK_ENTRY(panel->identity_entry));
+    if (!text || strlen(text) < 2) return G_SOURCE_REMOVE;
+    if (ln_erp_identity_search(&panel->erp_config, text, response, sizeof(response)) == 0)
+        update_identity_suggestions(panel, response);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean on_identity_match_selected(GtkEntryCompletion *completion, GtkTreeModel *model,
+                                           GtkTreeIter *iter, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    gchar *identity_id = NULL;
+    (void)completion;
+    gtk_tree_model_get(model, iter, 1, &identity_id, -1);
+    if (identity_id) {
+        panel->suppress_identity_change = 1;
+        gtk_entry_set_text(GTK_ENTRY(panel->identity_entry), identity_id);
+        panel->suppress_identity_change = 0;
+        lookup_identity_now(panel, identity_id);
+        g_free(identity_id);
+    }
+    return TRUE;
+}
+
+static void on_identity_activate(GtkEntry *entry, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    const char *text = gtk_entry_get_text(entry);
+    if (panel->identity_search_timer) {
+        g_source_remove(panel->identity_search_timer);
+        panel->identity_search_timer = 0;
+    }
+    lookup_identity_now(panel, text);
+}
+
 static void on_identity_changed(GtkEditable *editable, gpointer user_data) {
     LnStationPanel *panel = (LnStationPanel *)user_data;
     const char *text = gtk_entry_get_text(GTK_ENTRY(editable));
     ln_station_set_identity(panel->ctx, text);
 
-    if (text && *text)
-        gtk_label_set_text(GTK_LABEL(panel->status_label), "Identity captured. Ready to measure.");
-    else
+    if (panel->suppress_identity_change) return;
+    if (panel->identity_search_timer) {
+        g_source_remove(panel->identity_search_timer);
+        panel->identity_search_timer = 0;
+    }
+
+    if (text && *text) {
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "Searching ERP identities...");
+        if (panel->erp_config.enabled && panel->erp_config.auto_lookup && strlen(text) >= 2)
+            panel->identity_search_timer = g_timeout_add(350, identity_search_timeout, panel);
+    } else {
+        if (panel->identity_store) gtk_list_store_clear(panel->identity_store);
         gtk_label_set_text(GTK_LABEL(panel->status_label), "Ready. Scan or enter an identity.");
+    }
 }
 
 static void on_work_order_changed(GtkEditable *editable, gpointer user_data) {
@@ -210,7 +455,8 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     add_class(header, "lnws-header");
     GtkWidget *brand = gtk_label_new("LN WATCHMAKER STATION");
     GtkWidget *subtitle = gtk_label_new("SCAN FIRST. MEASURE SECOND. EVERY RESULT BELONGS TO AN IDENTITY.");
-    GtkWidget *bench = gtk_label_new("●  Bench 01");
+    GtkWidget *bench = gtk_label_new("●  Bench 01  ·  LOCAL");
+    panel->bench_label = bench;
     add_class(brand, "lnws-brand");
     add_class(subtitle, "lnws-subtitle");
     add_class(bench, "lnws-bench");
@@ -224,12 +470,30 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
 
     GtkWidget *identity_card = make_card("⌃  IDENTITY     ✓ IDENTIFIED");
     panel->identity_entry = gtk_entry_new();
+    panel->movement_serial_entry = gtk_entry_new();
+    panel->movement_part_entry = gtk_entry_new();
+    panel->watch_unit_entry = gtk_entry_new();
+    panel->identity_status_entry = gtk_entry_new();
+    gtk_editable_set_editable(GTK_EDITABLE(panel->movement_serial_entry), FALSE);
+    gtk_editable_set_editable(GTK_EDITABLE(panel->movement_part_entry), FALSE);
+    gtk_editable_set_editable(GTK_EDITABLE(panel->watch_unit_entry), FALSE);
+    gtk_editable_set_editable(GTK_EDITABLE(panel->identity_status_entry), FALSE);
+
+    panel->identity_store = gtk_list_store_new(2, G_TYPE_STRING, G_TYPE_STRING);
+    panel->identity_completion = gtk_entry_completion_new();
+    gtk_entry_completion_set_model(panel->identity_completion, GTK_TREE_MODEL(panel->identity_store));
+    gtk_entry_completion_set_text_column(panel->identity_completion, 0);
+    gtk_entry_completion_set_minimum_key_length(panel->identity_completion, 2);
+    gtk_entry_completion_set_popup_completion(panel->identity_completion, TRUE);
+    gtk_entry_completion_set_inline_completion(panel->identity_completion, FALSE);
+    gtk_entry_set_completion(GTK_ENTRY(panel->identity_entry), panel->identity_completion);
     panel->work_order_entry = gtk_entry_new();
     panel->operator_entry = gtk_entry_new();
     panel->position_combo = gtk_combo_box_text_new();
     panel->qa_standard_combo = gtk_combo_box_text_new();
     panel->temperature_combo = gtk_combo_box_text_new();
     panel->measurement_type_combo = gtk_combo_box_text_new();
+    panel->erp_button = gtk_button_new_with_label("⚙  ERP Connection");
 
     gtk_entry_set_placeholder_text(GTK_ENTRY(panel->identity_entry), "LN-SER-00025 / watch serial");
     gtk_entry_set_placeholder_text(GTK_ENTRY(panel->work_order_entry), "LN-MFG-00042 / optional");
@@ -257,7 +521,11 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Regulation Check");
     gtk_combo_box_set_active(GTK_COMBO_BOX(panel->measurement_type_combo), 0);
 
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Watch / Serial", panel->identity_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Search / Scan", panel->identity_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Movement S/N", panel->movement_serial_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Movement / Part", panel->movement_part_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Watch Unit", panel->watch_unit_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_card), make_row("ERP Status", panel->identity_status_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Work Order", panel->work_order_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Operator", panel->operator_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Position", panel->position_combo), FALSE, FALSE, 0);
@@ -326,6 +594,7 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_label_set_line_wrap(GTK_LABEL(data_help), TRUE);
     add_class(data_help, "lnws-muted");
     gtk_container_add(GTK_CONTAINER(panel->data_entry_revealer), data_help);
+    gtk_box_pack_start(GTK_BOX(data_card), panel->erp_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(data_card), panel->data_entry_toggle, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(data_card), panel->data_entry_revealer, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), data_card, FALSE, FALSE, 0);
@@ -349,6 +618,8 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_box_pack_start(GTK_BOX(root), panel->status_label, FALSE, FALSE, 8);
 
     g_signal_connect(panel->identity_entry, "changed", G_CALLBACK(on_identity_changed), panel);
+    g_signal_connect(panel->identity_entry, "activate", G_CALLBACK(on_identity_activate), panel);
+    g_signal_connect(panel->identity_completion, "match-selected", G_CALLBACK(on_identity_match_selected), panel);
     g_signal_connect(panel->work_order_entry, "changed", G_CALLBACK(on_work_order_changed), panel);
     g_signal_connect(panel->operator_entry, "changed", G_CALLBACK(on_operator_changed), panel);
     g_signal_connect(panel->position_combo, "changed", G_CALLBACK(on_position_changed), panel);
@@ -357,6 +628,18 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     g_signal_connect(panel->measurement_type_combo, "changed", G_CALLBACK(on_measurement_type_changed), panel);
     g_signal_connect(panel->next_button, "clicked", G_CALLBACK(on_next_position), root);
     g_signal_connect(panel->data_entry_toggle, "clicked", G_CALLBACK(on_toggle_data_entry), panel);
+    g_signal_connect(panel->erp_button, "clicked", G_CALLBACK(on_erp_settings), panel);
+
+    {
+        char config_error[512] = {0};
+        int config_result = ln_erp_config_load(&panel->erp_config, config_error, sizeof(config_error));
+        ln_erp_config_apply_to_station(&panel->erp_config, panel->ctx);
+        update_erp_status(panel);
+        if (config_result < 0)
+            gtk_label_set_text(GTK_LABEL(panel->status_label), config_error);
+        else if (panel->erp_config.enabled)
+            gtk_label_set_text(GTK_LABEL(panel->status_label), "ERP configuration loaded. Ready to scan an identity.");
+    }
 
     g_object_set_data_full(G_OBJECT(root), "ln-station-panel", panel, g_free);
     refresh_position_rows(panel);

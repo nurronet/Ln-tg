@@ -6,7 +6,7 @@
 #include <time.h>
 
 #ifndef LN_STATION_VERSION
-#define LN_STATION_VERSION "0.8.0"
+#define LN_STATION_VERSION "0.9.0"
 #endif
 
 static char ln_station_global_position[32] = "Dial Up";
