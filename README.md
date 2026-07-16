@@ -1,25 +1,54 @@
-# LNWS Milestone 0.10 ERP Identity Smart Search
+# LNWS Milestone 0.10.1 ERP Search Diagnostics
 
-Adds:
+Adds visible diagnostics to the smart identity search.
 
-- debounced partial search after two characters
-- autocomplete popup with matching ERP identities
-- exact barcode/serial lookup when Enter is received
-- automatic form population for movement serial, movement/part, watch unit, work order, ERP status, measurement type, and QA profile
+## New status messages
 
-A USB barcode scanner configured to send Enter will immediately select and load the exact identity.
+- search queued with the 350 ms debounce
+- exact query being searched
+- endpoint name and 10-second timeout
+- response time in milliseconds
+- number of autocomplete matches parsed
+- explicit no-results message with a response excerpt
+- HTTP status and ERP response body on server errors
+- network/TLS/timeout details on libcurl failures
 
-## Required backend
+The same diagnostics are also printed to the terminal with prefixes:
 
-Deploy FreeERP v1.4.4 from the paired backend overlay first.
+```text
+[LNWS ERP]
+[LNWS SEARCH]
+```
+
+No API key or secret is printed.
+
+## Files changed
+
+- `src/ln_erp_config.c`
+- `src/ln_station_panel.c`
+
+The other files are included unchanged so this package can replace the full
+Milestone 0.10 modified-file set.
 
 ## Build
-
-Copy the modified files over the current LNWS source, then:
 
 ```bash
 make clean
 ./autogen.sh
 ./configure
 make -j1
+```
+
+## Expected examples
+
+```text
+ERP search complete: 2 matches in 184 ms. Use arrow keys or click a result.
+```
+
+```text
+ERP search timed out after 10.0 s. Check server reachability, TLS, or endpoint deployment.
+```
+
+```text
+ERP search failed: code 417 after 220 ms. Detail: { ... }
 ```

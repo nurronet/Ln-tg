@@ -119,6 +119,13 @@ static void refresh_position_rows(LnStationPanel *panel) {
 }
 
 
+static void set_status_and_flush(LnStationPanel *panel, const char *text) {
+    if (!panel || !panel->status_label) return;
+    gtk_label_set_text(GTK_LABEL(panel->status_label), text ? text : "");
+    while (gtk_events_pending())
+        gtk_main_iteration_do(FALSE);
+}
+
 static void update_erp_status(LnStationPanel *panel) {
     char bench_text[128];
     if (!panel) return;
@@ -278,14 +285,15 @@ static void lookup_identity_now(LnStationPanel *panel, const char *identity) {
     }
 }
 
-static void update_identity_suggestions(LnStationPanel *panel, const char *json) {
+static int update_identity_suggestions(LnStationPanel *panel, const char *json) {
     GRegex *regex;
     GMatchInfo *match = NULL;
-    if (!panel || !panel->identity_store) return;
+    int count = 0;
+    if (!panel || !panel->identity_store) return 0;
     gtk_list_store_clear(panel->identity_store);
 
     regex = g_regex_new("\\{[^{}]*\\\"identity_id\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"[^{}]*\\\"display\\\"\\s*:\\s*\\\"((?:\\\\.|[^\\\"])*)\\\"[^{}]*\\}", G_REGEX_DOTALL, 0, NULL);
-    if (!regex) return;
+    if (!regex) return 0;
     g_regex_match(regex, json ? json : "", 0, &match);
     while (match && g_match_info_matches(match)) {
         gchar *raw_id = g_match_info_fetch(match, 1);
@@ -295,23 +303,69 @@ static void update_identity_suggestions(LnStationPanel *panel, const char *json)
         GtkTreeIter iter;
         gtk_list_store_append(panel->identity_store, &iter);
         gtk_list_store_set(panel->identity_store, &iter, 0, display, 1, identity_id, -1);
+        count++;
         g_free(raw_id); g_free(raw_display); g_free(identity_id); g_free(display);
         if (!g_match_info_next(match, NULL)) break;
     }
     if (match) g_match_info_free(match);
     g_regex_unref(regex);
+    return count;
 }
 
 static gboolean identity_search_timeout(gpointer user_data) {
     LnStationPanel *panel = (LnStationPanel *)user_data;
     const char *text;
     char response[32768];
+    char message[1024];
+    gint64 started_us;
+    double elapsed_ms;
+    int rc;
+    int count = 0;
+
     panel->identity_search_timer = 0;
-    if (!panel || !panel->erp_config.enabled || !panel->erp_config.auto_lookup) return G_SOURCE_REMOVE;
+    if (!panel || !panel->erp_config.enabled || !panel->erp_config.auto_lookup)
+        return G_SOURCE_REMOVE;
+
     text = gtk_entry_get_text(GTK_ENTRY(panel->identity_entry));
-    if (!text || strlen(text) < 2) return G_SOURCE_REMOVE;
-    if (ln_erp_identity_search(&panel->erp_config, text, response, sizeof(response)) == 0)
-        update_identity_suggestions(panel, response);
+    if (!text || strlen(text) < 2)
+        return G_SOURCE_REMOVE;
+
+    g_snprintf(message, sizeof(message),
+               "ERP search: '%s' · endpoint search_identities · timeout 10s...", text);
+    set_status_and_flush(panel, message);
+    fprintf(stderr, "[LNWS SEARCH] query='%s' station='%s'\n",
+            text, panel->erp_config.station_id);
+    fflush(stderr);
+
+    started_us = g_get_monotonic_time();
+    response[0] = '\0';
+    rc = ln_erp_identity_search(&panel->erp_config, text, response, sizeof(response));
+    elapsed_ms = (g_get_monotonic_time() - started_us) / 1000.0;
+
+    if (rc == 0) {
+        count = update_identity_suggestions(panel, response);
+        if (count > 0) {
+            g_snprintf(message, sizeof(message),
+                       "ERP search complete: %d match%s in %.0f ms. Use arrow keys or click a result.",
+                       count, count == 1 ? "" : "es", elapsed_ms);
+        } else {
+            g_snprintf(message, sizeof(message),
+                       "ERP search complete: no matches for '%s' (%.0f ms). Response: %.420s",
+                       text, elapsed_ms, response[0] ? response : "empty body");
+        }
+    } else if (rc == -408) {
+        g_snprintf(message, sizeof(message),
+                   "ERP search timed out after %.1f s. Check server reachability, TLS, or endpoint deployment. Detail: %.420s",
+                   elapsed_ms / 1000.0, response);
+    } else {
+        g_snprintf(message, sizeof(message),
+                   "ERP search failed: code %d after %.0f ms. Detail: %.500s",
+                   rc, elapsed_ms, response[0] ? response : "No response body");
+    }
+
+    gtk_label_set_text(GTK_LABEL(panel->status_label), message);
+    fprintf(stderr, "[LNWS SEARCH] %s\n", message);
+    fflush(stderr);
     return G_SOURCE_REMOVE;
 }
 
@@ -353,9 +407,20 @@ static void on_identity_changed(GtkEditable *editable, gpointer user_data) {
     }
 
     if (text && *text) {
-        gtk_label_set_text(GTK_LABEL(panel->status_label), "Searching ERP identities...");
-        if (panel->erp_config.enabled && panel->erp_config.auto_lookup && strlen(text) >= 2)
+        if (!panel->erp_config.enabled) {
+            gtk_label_set_text(GTK_LABEL(panel->status_label),
+                               "ERP search unavailable: synchronization is disabled in ERP Connection settings.");
+        } else if (!panel->erp_config.auto_lookup) {
+            gtk_label_set_text(GTK_LABEL(panel->status_label),
+                               "ERP auto-search is disabled. Press Enter to perform an exact lookup.");
+        } else if (strlen(text) < 2) {
+            gtk_label_set_text(GTK_LABEL(panel->status_label),
+                               "Enter at least 2 characters to search ERP.");
+        } else {
+            gtk_label_set_text(GTK_LABEL(panel->status_label),
+                               "ERP search queued (350 ms debounce)...");
             panel->identity_search_timer = g_timeout_add(350, identity_search_timeout, panel);
+        }
     } else {
         if (panel->identity_store) gtk_list_store_clear(panel->identity_store);
         gtk_label_set_text(GTK_LABEL(panel->status_label), "Ready. Scan or enter an identity.");

@@ -20,6 +20,13 @@ static void set_error(char *dst, unsigned long len, const char *message) {
     safe_copy(dst, len, message ? message : "Unknown error");
 }
 
+static void ln_erp_debug(const char *operation, const char *detail) {
+    fprintf(stderr, "[LNWS ERP] %s: %s\n",
+            operation ? operation : "request",
+            detail ? detail : "");
+    fflush(stderr);
+}
+
 static void normalize_base_url(char *url, unsigned long len) {
     size_t n;
     if (!url || !*url) return;
@@ -180,6 +187,8 @@ int ln_erp_config_test_connection(const LnErpConfig *config, char *response_text
     char station_encoded[256];
     char *escaped_station;
     long status = 0;
+    double total_seconds = 0.0;
+    double connect_seconds = 0.0;
     ResponseBuffer response;
 
     if (!config || !config->base_url[0] || !config->api_key[0] || !config->api_secret[0]) {
@@ -255,6 +264,8 @@ static int ln_erp_authenticated_get(const LnErpConfig *config, const char *metho
     char url[1536];
     char auth[640];
     long status = 0;
+    double total_seconds = 0.0;
+    double connect_seconds = 0.0;
     ResponseBuffer response;
 
     if (!config || !config->enabled || !config->base_url[0] ||
@@ -294,19 +305,46 @@ static int ln_erp_authenticated_get(const LnErpConfig *config, const char *metho
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, config->verify_tls ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, config->verify_tls ? 2L : 0L);
 
+    ln_erp_debug("GET", url);
     result = curl_easy_perform(curl);
-    if (result == CURLE_OK)
+    if (result == CURLE_OK) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_seconds);
+        curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect_seconds);
+    }
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
 
     if (result != CURLE_OK) {
-        set_error(response_text, response_text_len, curl_easy_strerror(result));
-        return -3;
+        char message[1024];
+        g_snprintf(message, sizeof(message),
+                   "Network error: %s (connect timeout 5s, total timeout 10s)",
+                   curl_easy_strerror(result));
+        ln_erp_debug("ERROR", message);
+        set_error(response_text, response_text_len, message);
+        return result == CURLE_OPERATION_TIMEDOUT ? -408 : -3;
     }
-    if (status < 200 || status >= 300)
+    if (status < 200 || status >= 300) {
+        char body[1200];
+        char message[1800];
+        safe_copy(body, sizeof(body), response_text && response_text[0] ? response_text : "No response body");
+        g_snprintf(message, sizeof(message),
+                   "HTTP %ld after %.0f ms (connect %.0f ms)\n%s",
+                   status, total_seconds * 1000.0, connect_seconds * 1000.0, body);
+        ln_erp_debug("HTTP ERROR", message);
+        set_error(response_text, response_text_len, message);
         return (int)status;
+    }
+
+    {
+        char message[256];
+        g_snprintf(message, sizeof(message),
+                   "HTTP %ld in %.0f ms (connect %.0f ms, %lu bytes)",
+                   status, total_seconds * 1000.0, connect_seconds * 1000.0,
+                   response.length);
+        ln_erp_debug("SUCCESS", message);
+    }
     return 0;
 }
 
