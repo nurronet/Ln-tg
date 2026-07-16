@@ -1,5 +1,7 @@
 #include "ln_station.h"
 
+#include <curl/curl.h>
+#include <glib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,23 +36,64 @@ static void safe_copy(char *dst, unsigned long dst_len, const char *src) {
     snprintf(dst, dst_len, "%s", src);
 }
 
-static void json_escape(FILE *f, const char *s) {
+static void json_escape_gstring(GString *out, const char *s) {
     const unsigned char *p = (const unsigned char *)(s ? s : "");
-    fputc('"', f);
+    g_string_append_c(out, '"');
     while (*p) {
         switch (*p) {
-            case '\\': fputs("\\\\", f); break;
-            case '"':  fputs("\\\"", f); break;
-            case '\n': fputs("\\n", f); break;
-            case '\r': fputs("\\r", f); break;
-            case '\t': fputs("\\t", f); break;
+            case '\\': g_string_append(out, "\\\\"); break;
+            case '"':  g_string_append(out, "\\\""); break;
+            case '\n': g_string_append(out, "\\n"); break;
+            case '\r': g_string_append(out, "\\r"); break;
+            case '\t': g_string_append(out, "\\t"); break;
             default:
-                if (*p < 32) fprintf(f, "\\u%04x", *p);
-                else fputc(*p, f);
+                if (*p < 32) g_string_append_printf(out, "\\u%04x", *p);
+                else g_string_append_c(out, (char)*p);
         }
         p++;
     }
-    fputc('"', f);
+    g_string_append_c(out, '"');
+}
+
+/* Shared by ln_station_export_json (local file) and ln_station_submit_result
+ * (HTTP POST body) so both always serialize the ln_tg_timing_result_v1
+ * schema identically. Caller owns the returned GString. */
+static GString *build_timing_result_json(const LnStationContext *ctx, const LnTimingResult *result) {
+    GString *out = g_string_sized_new(1024);
+
+    g_string_append(out, "{\n");
+    g_string_append(out, "  \"schema\": \"ln_tg_timing_result_v1\",\n");
+    g_string_append(out, "  \"station_version\": "); json_escape_gstring(out, LN_STATION_VERSION); g_string_append(out, ",\n");
+    g_string_append(out, "  \"station_id\": "); json_escape_gstring(out, ctx->station_id); g_string_append(out, ",\n");
+    g_string_append(out, "  \"operator_id\": "); json_escape_gstring(out, ctx->operator_id); g_string_append(out, ",\n");
+    g_string_append(out, "  \"identity_id\": "); json_escape_gstring(out, ctx->identity_id); g_string_append(out, ",\n");
+    g_string_append(out, "  \"work_order\": "); json_escape_gstring(out, ctx->work_order); g_string_append(out, ",\n");
+    g_string_append(out, "  \"position\": "); json_escape_gstring(out, ctx->position); g_string_append(out, ",\n");
+    g_string_append(out, "  \"qa_standard\": "); json_escape_gstring(out, ln_station_current_qa_standard()); g_string_append(out, ",\n");
+    g_string_append_printf(out, "  \"qa_rate_limit_s_per_day\": %d,\n", ln_station_current_qa_rate_limit());
+    g_string_append(out, "  \"temperature_condition\": "); json_escape_gstring(out, ln_station_current_temperature_condition()); g_string_append(out, ",\n");
+    g_string_append(out, "  \"measurement_type\": "); json_escape_gstring(out, ln_station_current_measurement_type()); g_string_append(out, ",\n");
+    g_string_append_printf(out, "  \"followup_mode\": %s,\n", ln_station_is_followup() ? "true" : "false");
+    g_string_append(out, "  \"timestamp_iso\": "); json_escape_gstring(out, result->timestamp_iso); g_string_append(out, ",\n");
+    g_string_append(out, "  \"measurements\": {\n");
+    g_string_append_printf(out, "    \"rate_s_per_day\": %.6f,\n", result->rate_s_per_day);
+    g_string_append_printf(out, "    \"beat_error_ms\": %.6f,\n", result->beat_error_ms);
+    g_string_append_printf(out, "    \"amplitude_deg\": %.6f,\n", result->amplitude_deg);
+    g_string_append_printf(out, "    \"beat_frequency_bph\": %.6f,\n", result->beat_frequency_bph);
+    g_string_append_printf(out, "    \"lift_angle_deg\": %.6f,\n", result->lift_angle_deg);
+    g_string_append_printf(out, "    \"sample_rate_hz\": %.6f,\n", result->sample_rate_hz);
+    g_string_append_printf(out, "    \"duration_seconds\": %.6f\n", result->duration_seconds);
+    g_string_append(out, "  },\n");
+    g_string_append(out, "  \"baseline\": {\n");
+    g_string_append_printf(out, "    \"has_baseline\": %s,\n", result->has_baseline ? "true" : "false");
+    g_string_append_printf(out, "    \"rate_s_per_day\": %.6f,\n", result->baseline_rate_s_per_day);
+    g_string_append_printf(out, "    \"beat_error_ms\": %.6f,\n", result->baseline_beat_error_ms);
+    g_string_append_printf(out, "    \"amplitude_deg\": %.6f\n", result->baseline_amplitude_deg);
+    g_string_append(out, "  },\n");
+    g_string_append(out, "  \"notes\": "); json_escape_gstring(out, result->notes); g_string_append(out, "\n");
+    g_string_append(out, "}\n");
+
+    return out;
 }
 
 static void now_compact(char *buf, unsigned long len) {
@@ -80,6 +123,7 @@ void ln_station_init(LnStationContext *ctx) {
     ln_station_set_measurement_type("Initial Certification");
     ctx->export_enabled = true;
     ctx->submit_enabled = false;
+    ctx->verify_tls = true;
 }
 
 void ln_station_set_identity(LnStationContext *ctx, const char *identity_id) {
@@ -217,6 +261,7 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     char stamp[32];
     char safe_identity[160];
     char path[1024];
+    GString *body;
     FILE *f;
     unsigned long i;
 
@@ -234,50 +279,139 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     f = fopen(path, "w");
     if (!f) return -2;
 
-    fprintf(f, "{\n");
-    fprintf(f, "  \"schema\": \"ln_tg_timing_result_v1\",\n");
-    fprintf(f, "  \"station_version\": "); json_escape(f, LN_STATION_VERSION); fprintf(f, ",\n");
-    fprintf(f, "  \"station_id\": "); json_escape(f, ctx->station_id); fprintf(f, ",\n");
-    fprintf(f, "  \"operator_id\": "); json_escape(f, ctx->operator_id); fprintf(f, ",\n");
-    fprintf(f, "  \"identity_id\": "); json_escape(f, ctx->identity_id); fprintf(f, ",\n");
-    fprintf(f, "  \"work_order\": "); json_escape(f, ctx->work_order); fprintf(f, ",\n");
-    fprintf(f, "  \"position\": "); json_escape(f, ctx->position); fprintf(f, ",\n");
-    fprintf(f, "  \"qa_standard\": "); json_escape(f, ln_station_current_qa_standard()); fprintf(f, ",\n");
-    fprintf(f, "  \"qa_rate_limit_s_per_day\": %d,\n", ln_station_current_qa_rate_limit());
-    fprintf(f, "  \"temperature_condition\": "); json_escape(f, ln_station_current_temperature_condition()); fprintf(f, ",\n");
-    fprintf(f, "  \"measurement_type\": "); json_escape(f, ln_station_current_measurement_type()); fprintf(f, ",\n");
-    fprintf(f, "  \"followup_mode\": %s,\n", ln_station_is_followup() ? "true" : "false");
-    fprintf(f, "  \"timestamp_iso\": "); json_escape(f, result->timestamp_iso); fprintf(f, ",\n");
-    fprintf(f, "  \"measurements\": {\n");
-    fprintf(f, "    \"rate_s_per_day\": %.6f,\n", result->rate_s_per_day);
-    fprintf(f, "    \"beat_error_ms\": %.6f,\n", result->beat_error_ms);
-    fprintf(f, "    \"amplitude_deg\": %.6f,\n", result->amplitude_deg);
-    fprintf(f, "    \"beat_frequency_bph\": %.6f,\n", result->beat_frequency_bph);
-    fprintf(f, "    \"lift_angle_deg\": %.6f,\n", result->lift_angle_deg);
-    fprintf(f, "    \"sample_rate_hz\": %.6f,\n", result->sample_rate_hz);
-    fprintf(f, "    \"duration_seconds\": %.6f\n", result->duration_seconds);
-    fprintf(f, "  },\n");
-    fprintf(f, "  \"baseline\": {\n");
-    fprintf(f, "    \"has_baseline\": %s,\n", result->has_baseline ? "true" : "false");
-    fprintf(f, "    \"rate_s_per_day\": %.6f,\n", result->baseline_rate_s_per_day);
-    fprintf(f, "    \"beat_error_ms\": %.6f,\n", result->baseline_beat_error_ms);
-    fprintf(f, "    \"amplitude_deg\": %.6f\n", result->baseline_amplitude_deg);
-    fprintf(f, "  },\n");
-    fprintf(f, "  \"notes\": "); json_escape(f, result->notes); fprintf(f, "\n");
-    fprintf(f, "}\n");
+    body = build_timing_result_json(ctx, result);
+    fputs(body->str, f);
+    g_string_free(body, TRUE);
     fclose(f);
 
     if (out_path && out_path_len > 0) safe_copy(out_path, out_path_len, path);
     return 0;
 }
 
+typedef struct {
+    char *buffer;
+    size_t capacity;
+    size_t length;
+} LnResponseBuffer;
+
+static size_t ln_response_write(void *contents, size_t size, size_t nmemb, void *user_data) {
+    size_t bytes = size * nmemb;
+    LnResponseBuffer *response = (LnResponseBuffer *)user_data;
+    size_t remaining;
+    size_t copy_len;
+
+    if (!response || !response->buffer || response->capacity == 0) return bytes;
+    remaining = response->capacity - response->length - 1;
+    copy_len = bytes < remaining ? bytes : remaining;
+    if (copy_len > 0) {
+        memcpy(response->buffer + response->length, contents, copy_len);
+        response->length += copy_len;
+        response->buffer[response->length] = '\0';
+    }
+    return bytes;
+}
+
 int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len) {
-    (void)result;
-    if (!ctx) return -1;
+    CURL *curl;
+    CURLcode curl_result;
+    struct curl_slist *headers = NULL;
+    GString *body;
+    char url[768];
+    char auth[640];
+    char user_agent[96];
+    long status = 0;
+    double total_seconds = 0.0;
+    double connect_seconds = 0.0;
+    LnResponseBuffer resp_buf;
+
+    if (!ctx || !result) return -1;
     if (!ctx->submit_enabled) {
         safe_copy(response, response_len, "submit disabled; JSON export only");
         return 1;
     }
-    safe_copy(response, response_len, "submit not implemented in v0.2.1");
-    return 2;
+    if (!ctx->erp_base_url[0] || !ctx->api_key[0] || !ctx->api_secret[0]) {
+        safe_copy(response, response_len, "ERP connection is not fully configured (base URL, API key, and secret are required)");
+        return -1;
+    }
+    if (!ctx->identity_id[0]) {
+        safe_copy(response, response_len, "An identity is required before submitting a result");
+        return -1;
+    }
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl = curl_easy_init();
+    if (!curl) {
+        safe_copy(response, response_len, "Unable to initialize HTTP client");
+        return -2;
+    }
+
+    body = build_timing_result_json(ctx, result);
+
+    g_snprintf(url, sizeof(url), "%s/api/method/ln_watch_inventory.freeerp.submit_timing_result", ctx->erp_base_url);
+    g_snprintf(auth, sizeof(auth), "Authorization: token %s:%s", ctx->api_key, ctx->api_secret);
+    g_snprintf(user_agent, sizeof(user_agent), "User-Agent: LN-Watchmaker-Station/%s", LN_STATION_VERSION);
+    headers = curl_slist_append(headers, auth);
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, user_agent);
+
+    resp_buf.buffer = response;
+    resp_buf.capacity = response_len;
+    resp_buf.length = 0;
+    if (response && response_len) response[0] = '\0';
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body->str);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body->len);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ln_response_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_buf);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, ctx->verify_tls ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, ctx->verify_tls ? 2L : 0L);
+
+    fprintf(stderr, "[LNWS SUBMIT] POST %s (identity=%s position=%s)\n", url, ctx->identity_id, ctx->position);
+    fflush(stderr);
+
+    curl_result = curl_easy_perform(curl);
+    if (curl_result == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+        curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total_seconds);
+        curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connect_seconds);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    g_string_free(body, TRUE);
+
+    if (curl_result != CURLE_OK) {
+        char message[1024];
+        g_snprintf(message, sizeof(message),
+                   "Network error: %s (connect timeout 8s, total timeout 20s)",
+                   curl_easy_strerror(curl_result));
+        fprintf(stderr, "[LNWS SUBMIT] ERROR: %s\n", message);
+        fflush(stderr);
+        safe_copy(response, response_len, message);
+        return curl_result == CURLE_OPERATION_TIMEDOUT ? -408 : -3;
+    }
+
+    if (status < 200 || status >= 300) {
+        char body_excerpt[1200];
+        char message[1800];
+        safe_copy(body_excerpt, sizeof(body_excerpt), response && response[0] ? response : "No response body");
+        g_snprintf(message, sizeof(message),
+                   "HTTP %ld after %.0f ms (connect %.0f ms)\n%s",
+                   status, total_seconds * 1000.0, connect_seconds * 1000.0, body_excerpt);
+        fprintf(stderr, "[LNWS SUBMIT] HTTP ERROR: %s\n", message);
+        fflush(stderr);
+        safe_copy(response, response_len, message);
+        return (int)status;
+    }
+
+    fprintf(stderr, "[LNWS SUBMIT] SUCCESS: HTTP %ld in %.0f ms (connect %.0f ms)\n",
+            status, total_seconds * 1000.0, connect_seconds * 1000.0);
+    fflush(stderr);
+    return 0;
 }

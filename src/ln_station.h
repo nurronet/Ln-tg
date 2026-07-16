@@ -22,6 +22,7 @@ typedef struct {
     char api_secret[256];
     bool submit_enabled;
     bool export_enabled;
+    bool verify_tls;
     char export_dir[512];
 } LnStationContext;
 

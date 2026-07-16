@@ -153,6 +153,7 @@ void ln_erp_config_apply_to_station(const LnErpConfig *config, LnStationContext 
     safe_copy(ctx->station_id, sizeof(ctx->station_id), config->station_id);
     safe_copy(ctx->export_dir, sizeof(ctx->export_dir), config->queue_dir);
     ctx->submit_enabled = config->enabled ? true : false;
+    ctx->verify_tls = config->verify_tls ? true : false;
 }
 
 typedef struct {

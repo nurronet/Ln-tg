@@ -682,33 +682,42 @@ static void ln_station_timestamp_iso(char *buf, size_t len) {
         strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
-static void save_ln_timing_json(GtkMenuItem *m, struct main_window *w) {
-    UNUSED(m);
-
+/* Shared by the "Save JSON" and "Complete" buttons so both work from an
+ * identically-built result. Shows its own error dialog and returns false
+ * on failure. */
+static bool build_ln_timing_result_from_active_snapshot(struct main_window *w, LnTimingResult *out) {
     struct snapshot *snapshot = w->active_snapshot;
     if (!snapshot || snapshot->calibrate || !snapshot->pb) {
         error("No stable timing result is available yet.");
-        return;
+        return false;
     }
 
     if (!ln_ctx.identity_id[0]) {
         error("Scan or enter an LN identity before saving timing data.");
-        return;
+        return false;
     }
 
     compute_results(snapshot);
 
+    memset(out, 0, sizeof(*out));
+    out->rate_s_per_day = snapshot->rate;
+    out->beat_error_ms = snapshot->be;
+    out->amplitude_deg = snapshot->amp;
+    out->beat_frequency_bph = snapshot->bph ? snapshot->bph : snapshot->guessed_bph;
+    out->lift_angle_deg = snapshot->la;
+    out->sample_rate_hz = snapshot->sample_rate;
+    out->duration_seconds = 0.0;
+    ln_station_timestamp_iso(out->timestamp_iso, sizeof(out->timestamp_iso));
+    snprintf(out->notes, sizeof(out->notes), "Saved from Tg real-time display");
+    return true;
+}
+
+static void save_ln_timing_json(GtkMenuItem *m, struct main_window *w) {
+    UNUSED(m);
+
     LnTimingResult result;
-    memset(&result, 0, sizeof(result));
-    result.rate_s_per_day = snapshot->rate;
-    result.beat_error_ms = snapshot->be;
-    result.amplitude_deg = snapshot->amp;
-    result.beat_frequency_bph = snapshot->bph ? snapshot->bph : snapshot->guessed_bph;
-    result.lift_angle_deg = snapshot->la;
-    result.sample_rate_hz = snapshot->sample_rate;
-    result.duration_seconds = 0.0;
-    ln_station_timestamp_iso(result.timestamp_iso, sizeof(result.timestamp_iso));
-    snprintf(result.notes, sizeof(result.notes), "Saved from Tg real-time display");
+    if (!build_ln_timing_result_from_active_snapshot(w, &result))
+        return;
 
     char out_path[1024];
     int rc = ln_station_export_json(&ln_ctx, &result, out_path, sizeof(out_path));
@@ -776,8 +785,41 @@ static void save_ln_timing_json_button(GtkButton *button, struct main_window *w)
 static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 {
 	UNUSED(button);
-	GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(w->window), 0, GTK_MESSAGE_INFO, GTK_BUTTONS_CLOSE,
-			"Timing session marked complete. ERP sync will be added in a future milestone.");
+
+	LnTimingResult result;
+	if (!build_ln_timing_result_from_active_snapshot(w, &result))
+		return;
+
+	/* Always keep a local copy first: submission over the network can fail
+	 * or be disabled, but the measurement itself should never be lost. */
+	char out_path[1024];
+	int export_rc = ln_station_export_json(&ln_ctx, &result, out_path, sizeof(out_path));
+	if (export_rc) {
+		error("Unable to save LN timing JSON. Code %d", export_rc);
+		return;
+	}
+
+	char response[4096];
+	int submit_rc = ln_station_submit_result(&ln_ctx, &result, response, sizeof(response));
+
+	GtkMessageType message_type = GTK_MESSAGE_INFO;
+	char message[4400];
+	if (submit_rc == 0) {
+		g_snprintf(message, sizeof(message),
+			"Timing session complete and submitted to ERP.\nLocal copy: %s\n%s",
+			out_path, response[0] ? response : "");
+	} else if (submit_rc == 1) {
+		g_snprintf(message, sizeof(message),
+			"Timing session marked complete.\nLocal copy: %s\nERP submission is disabled in ERP Connection settings.",
+			out_path);
+	} else {
+		message_type = GTK_MESSAGE_WARNING;
+		g_snprintf(message, sizeof(message),
+			"Timing session marked complete, but ERP submission failed (code %d).\nLocal copy saved: %s\n%s",
+			submit_rc, out_path, response);
+	}
+
+	GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(w->window), 0, message_type, GTK_BUTTONS_CLOSE, "%s", message);
 	gtk_dialog_run(GTK_DIALOG(dialog));
 	gtk_widget_destroy(dialog);
 }
