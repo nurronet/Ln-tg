@@ -63,6 +63,8 @@ typedef struct {
  * during the hold window, and reports a running average. */
 typedef struct {
     int active;
+    int pending;                        /* waiting out the reposition delay before auto-arming */
+    double pending_seconds_remaining;
     int complete;
     double elapsed_seconds;
     int required_seconds;

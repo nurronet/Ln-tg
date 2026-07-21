@@ -41,11 +41,20 @@ typedef struct {
     double amplitude_deg;
     double bph;
 } LnCaptureSample;
+/* After an auto-triggered position change, give the operator time to
+ * physically reposition the watch before the hold window starts
+ * counting -- otherwise the first few seconds of "capture" are really
+ * just movement noise from turning the mount. Only applies to auto
+ * mode; a manual Start Capture press begins immediately, since the
+ * operator is pressing the button because they're already in position. */
+#define LN_STATION_CAPTURE_REPOSITION_DELAY_SECONDS 5
+
 static LnCaptureSample ln_station_capture_samples[LN_STATION_MAX_CAPTURE_SAMPLES];
 static int ln_station_capture_sample_count = 0;
 static int ln_station_capture_active = 0;
 static int ln_station_capture_auto_mode = 0;
 static time_t ln_station_capture_started_at = 0;
+static time_t ln_station_capture_auto_start_at = 0;
 
 static void ln_station_capture_reset_for_new_position(void);
 
@@ -315,14 +324,18 @@ double ln_station_position_qa_seconds(void) {
 
 /* Called from ln_station_set_position on every position change. Always
  * clears the window (a capture from the previous position must never
- * bleed into the next one's average) and, once auto mode has latched
- * (i.e. Start Capture has been pressed at least once this session),
- * immediately re-arms capture for the new position with no button press
- * required. */
+ * bleed into the next one's average). Once auto mode has latched (i.e.
+ * Start Capture has been pressed at least once this session), arms a
+ * pending auto-start LN_STATION_CAPTURE_REPOSITION_DELAY_SECONDS in the
+ * future rather than activating immediately -- ln_station_capture_feed()
+ * checks and consumes that deadline on every tick. */
 static void ln_station_capture_reset_for_new_position(void) {
     ln_station_capture_sample_count = 0;
     ln_station_capture_started_at = 0;
-    ln_station_capture_active = ln_station_capture_auto_mode;
+    ln_station_capture_active = 0;
+    ln_station_capture_auto_start_at = ln_station_capture_auto_mode
+        ? time(NULL) + LN_STATION_CAPTURE_REPOSITION_DELAY_SECONDS
+        : 0;
 }
 
 void ln_station_capture_begin(void) {
@@ -330,12 +343,22 @@ void ln_station_capture_begin(void) {
     ln_station_capture_started_at = 0;
     ln_station_capture_active = 1;
     ln_station_capture_auto_mode = 1;
+    /* A manual press means the operator is already in position now --
+     * no reason to make them wait out the reposition delay too. */
+    ln_station_capture_auto_start_at = 0;
 }
 
 void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double amplitude_deg, double bph, int valid) {
-    time_t now_t;
+    time_t now_t = time(NULL);
 
-    if (!ln_station_capture_active) return;
+    if (!ln_station_capture_active) {
+        if (ln_station_capture_auto_start_at && now_t >= ln_station_capture_auto_start_at) {
+            ln_station_capture_active = 1;
+            ln_station_capture_auto_start_at = 0;
+        } else {
+            return;
+        }
+    }
 
     if (!valid) {
         /* Dropped/invalid reading mid-hold -- the window must restart
@@ -346,7 +369,6 @@ void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double
         return;
     }
 
-    now_t = time(NULL);
     if (!ln_station_capture_started_at)
         ln_station_capture_started_at = now_t;
 
@@ -363,14 +385,17 @@ void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double
 void ln_station_capture_status(LnCaptureStatus *out) {
     int i;
     double sum_rate = 0.0, sum_be = 0.0, sum_amp = 0.0, sum_bph = 0.0;
+    time_t now_t = time(NULL);
 
     if (!out) return;
     memset(out, 0, sizeof(*out));
 
     out->active = ln_station_capture_active;
+    out->pending = !ln_station_capture_active && ln_station_capture_auto_start_at > now_t;
+    out->pending_seconds_remaining = out->pending ? difftime(ln_station_capture_auto_start_at, now_t) : 0.0;
     out->required_seconds = ln_station_global_qa_hold_seconds;
     out->sample_count = ln_station_capture_sample_count;
-    out->elapsed_seconds = ln_station_capture_started_at ? difftime(time(NULL), ln_station_capture_started_at) : 0.0;
+    out->elapsed_seconds = ln_station_capture_started_at ? difftime(now_t, ln_station_capture_started_at) : 0.0;
     out->complete = ln_station_capture_active && ln_station_capture_sample_count > 0
                     && out->elapsed_seconds >= (double)ln_station_global_qa_hold_seconds;
 

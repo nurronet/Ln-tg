@@ -734,6 +734,17 @@ void ln_station_panel_refresh_measurement(GtkWidget *widget) {
     if (!panel) return;
     ln_station_capture_status(&status);
 
+    if (status.pending) {
+        snprintf(rate_text, sizeof(rate_text), "Rate              repositioning... (%.0fs)", status.pending_seconds_remaining);
+        gtk_label_set_text(GTK_LABEL(panel->measurement_rate_label), rate_text);
+        gtk_label_set_text(GTK_LABEL(panel->measurement_be_label), "Beat Error        repositioning...");
+        gtk_label_set_text(GTK_LABEL(panel->measurement_amp_label), "Amplitude         repositioning...");
+        gtk_label_set_text(GTK_LABEL(panel->measurement_bph_label), "BPH               repositioning...");
+        if (panel->capture_button)
+            gtk_button_set_label(GTK_BUTTON(panel->capture_button), "↻  Recapture");
+        return;
+    }
+
     if (!status.active) {
         gtk_label_set_text(GTK_LABEL(panel->measurement_rate_label), "Rate              waiting");
         gtk_label_set_text(GTK_LABEL(panel->measurement_be_label), "Beat Error        waiting");
@@ -773,12 +784,15 @@ void ln_station_panel_refresh_measurement(GtkWidget *widget) {
     gtk_label_set_text(GTK_LABEL(panel->measurement_bph_label), bph_text);
 }
 
-static void on_capture_clicked(GtkButton *button, gpointer user_data) {
-    (void)button;
-    GtkWidget *widget = GTK_WIDGET(user_data);
+void ln_station_panel_trigger_capture(GtkWidget *widget) {
     ln_station_capture_begin();
     ln_station_panel_refresh_measurement(widget);
     ln_station_panel_set_status(widget, "Capture started -- keep the watch steady until the hold completes.");
+}
+
+static void on_capture_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    ln_station_panel_trigger_capture(GTK_WIDGET(user_data));
 }
 
 void ln_station_panel_bind_capture(GtkWidget *widget) {

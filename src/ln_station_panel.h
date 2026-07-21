@@ -24,6 +24,12 @@ void ln_station_panel_refresh_measurement(GtkWidget *panel);
  * ln_station_capture_begin() and immediately refresh the display. */
 void ln_station_panel_bind_capture(GtkWidget *panel);
 
+/* Does what the Start Capture button's click handler does -- exposed so
+ * a second entry point (e.g. a top-toolbar icon button, for use with the
+ * data panel hidden) can trigger the same action without duplicating the
+ * begin+refresh+status-message sequence. */
+void ln_station_panel_trigger_capture(GtkWidget *panel);
+
 #ifdef __cplusplus
 }
 #endif

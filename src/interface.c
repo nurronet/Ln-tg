@@ -854,6 +854,14 @@ static void next_ln_position_button(GtkButton *button, struct main_window *w)
 		ln_station_panel_advance_position(ln_panel_widget);
 }
 
+static void start_capture_button(GtkButton *button, struct main_window *w)
+{
+	UNUSED(button);
+	UNUSED(w);
+	if(ln_panel_widget)
+		ln_station_panel_trigger_capture(ln_panel_widget);
+}
+
 static void toggle_ln_sidebar_button(GtkButton *button, struct main_window *w)
 {
 	UNUSED(button);
@@ -1087,6 +1095,11 @@ static void init_main_window(struct main_window *w)
 	gtk_widget_set_tooltip_text(ln_top_save_button, "Save Reading");
 	gtk_box_pack_start(GTK_BOX(hbox), ln_top_save_button, FALSE, FALSE, 0);
 	g_signal_connect(ln_top_save_button, "clicked", G_CALLBACK(save_ln_timing_json_button), w);
+
+	GtkWidget *ln_top_capture_button = gtk_button_new_with_label("↻");
+	gtk_widget_set_tooltip_text(ln_top_capture_button, "Start Capture / Recapture");
+	gtk_box_pack_start(GTK_BOX(hbox), ln_top_capture_button, FALSE, FALSE, 0);
+	g_signal_connect(ln_top_capture_button, "clicked", G_CALLBACK(start_capture_button), w);
 
 	GtkWidget *ln_top_next_button = gtk_button_new_with_label("→");
 	gtk_widget_set_tooltip_text(ln_top_next_button, "Next Position");

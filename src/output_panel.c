@@ -300,10 +300,12 @@ static gboolean output_draw_event(GtkWidget *widget, cairo_t *c, struct output_p
 
 			if(position && *position) {
 				char qa_buf[48];
+				LnCaptureStatus capture_status;
+				ln_station_capture_status(&capture_status);
 				cairo_set_source(c, white);
 				cairo_set_font_size(c, OUTPUT_FONT*2/3);
 				x = print_s(c, x + 18, y, " pos ");
-				cairo_set_source(c, goldenrod);
+				cairo_set_source(c, capture_status.complete ? green : goldenrod);
 				cairo_set_font_size(c, OUTPUT_FONT*2/3);
 				x = print_s(c, x, y, (char *)position);
 
