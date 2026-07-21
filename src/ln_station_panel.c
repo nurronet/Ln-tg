@@ -42,6 +42,11 @@ typedef struct {
     GtkWidget *bench_label;
     LnErpConfig erp_config;
     unsigned int completed_mask;
+    GtkWidget *measurement_rate_label;
+    GtkWidget *measurement_be_label;
+    GtkWidget *measurement_amp_label;
+    GtkWidget *measurement_bph_label;
+    GtkWidget *capture_button;
 } LnStationPanel;
 
 static void ln_station_panel_install_css(void) {
@@ -635,19 +640,22 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_box_pack_start(GTK_BOX(root), positions_card, FALSE, FALSE, 0);
 
     GtkWidget *measurement_card = make_card("⌁  MEASUREMENT");
-    GtkWidget *rate = gtk_label_new("Rate              waiting");
-    GtkWidget *be = gtk_label_new("Beat Error        waiting");
-    GtkWidget *amp = gtk_label_new("Amplitude         waiting");
-    GtkWidget *bph = gtk_label_new("BPH               waiting");
-    add_class(rate, "lnws-green");
-    gtk_widget_set_halign(rate, GTK_ALIGN_START);
-    gtk_widget_set_halign(be, GTK_ALIGN_START);
-    gtk_widget_set_halign(amp, GTK_ALIGN_START);
-    gtk_widget_set_halign(bph, GTK_ALIGN_START);
-    gtk_box_pack_start(GTK_BOX(measurement_card), rate, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(measurement_card), be, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(measurement_card), amp, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(measurement_card), bph, FALSE, FALSE, 0);
+    panel->measurement_rate_label = gtk_label_new("Rate              waiting");
+    panel->measurement_be_label = gtk_label_new("Beat Error        waiting");
+    panel->measurement_amp_label = gtk_label_new("Amplitude         waiting");
+    panel->measurement_bph_label = gtk_label_new("BPH               waiting");
+    add_class(panel->measurement_rate_label, "lnws-green");
+    gtk_widget_set_halign(panel->measurement_rate_label, GTK_ALIGN_START);
+    gtk_widget_set_halign(panel->measurement_be_label, GTK_ALIGN_START);
+    gtk_widget_set_halign(panel->measurement_amp_label, GTK_ALIGN_START);
+    gtk_widget_set_halign(panel->measurement_bph_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(measurement_card), panel->measurement_rate_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(measurement_card), panel->measurement_be_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(measurement_card), panel->measurement_amp_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(measurement_card), panel->measurement_bph_label, FALSE, FALSE, 0);
+    panel->capture_button = gtk_button_new_with_label("▶  Start Capture");
+    add_class(panel->capture_button, "lnws-action");
+    gtk_box_pack_start(GTK_BOX(measurement_card), panel->capture_button, FALSE, FALSE, 6);
     gtk_box_pack_start(GTK_BOX(root), measurement_card, FALSE, FALSE, 0);
 
     GtkWidget *data_card = make_card("⌨  DATA ENTRY");
@@ -716,6 +724,67 @@ void ln_station_panel_set_status(GtkWidget *widget, const char *status) {
     if (panel && panel->status_label) {
         gtk_label_set_text(GTK_LABEL(panel->status_label), status ? status : "");
     }
+}
+
+void ln_station_panel_refresh_measurement(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    LnCaptureStatus status;
+    char rate_text[64], be_text[64], amp_text[64], bph_text[64];
+
+    if (!panel) return;
+    ln_station_capture_status(&status);
+
+    if (!status.active) {
+        gtk_label_set_text(GTK_LABEL(panel->measurement_rate_label), "Rate              waiting");
+        gtk_label_set_text(GTK_LABEL(panel->measurement_be_label), "Beat Error        waiting");
+        gtk_label_set_text(GTK_LABEL(panel->measurement_amp_label), "Amplitude         waiting");
+        gtk_label_set_text(GTK_LABEL(panel->measurement_bph_label), "BPH               waiting");
+        if (panel->capture_button)
+            gtk_button_set_label(GTK_BUTTON(panel->capture_button), "▶  Start Capture");
+        return;
+    }
+
+    if (status.complete) {
+        snprintf(rate_text, sizeof(rate_text), "Rate              %+.1f s/d  ✓ (%d samples)", status.avg_rate_s_per_day, status.sample_count);
+        snprintf(be_text, sizeof(be_text), "Beat Error        %.1f ms", status.avg_beat_error_ms);
+        snprintf(amp_text, sizeof(amp_text), "Amplitude         %.0f deg", status.avg_amplitude_deg);
+        snprintf(bph_text, sizeof(bph_text), "BPH               %.0f", status.avg_bph);
+        if (panel->capture_button)
+            gtk_button_set_label(GTK_BUTTON(panel->capture_button), "↻  Recapture");
+    } else if (status.sample_count > 0) {
+        snprintf(rate_text, sizeof(rate_text), "Rate              %+.1f s/d  (%.0fs/%ds)", status.avg_rate_s_per_day, status.elapsed_seconds, status.required_seconds);
+        snprintf(be_text, sizeof(be_text), "Beat Error        %.1f ms", status.avg_beat_error_ms);
+        snprintf(amp_text, sizeof(amp_text), "Amplitude         %.0f deg", status.avg_amplitude_deg);
+        snprintf(bph_text, sizeof(bph_text), "BPH               %.0f", status.avg_bph);
+        if (panel->capture_button)
+            gtk_button_set_label(GTK_BUTTON(panel->capture_button), "↻  Recapture");
+    } else {
+        snprintf(rate_text, sizeof(rate_text), "Rate              capturing...");
+        snprintf(be_text, sizeof(be_text), "Beat Error        capturing...");
+        snprintf(amp_text, sizeof(amp_text), "Amplitude         capturing...");
+        snprintf(bph_text, sizeof(bph_text), "BPH               capturing...");
+        if (panel->capture_button)
+            gtk_button_set_label(GTK_BUTTON(panel->capture_button), "↻  Recapture");
+    }
+
+    gtk_label_set_text(GTK_LABEL(panel->measurement_rate_label), rate_text);
+    gtk_label_set_text(GTK_LABEL(panel->measurement_be_label), be_text);
+    gtk_label_set_text(GTK_LABEL(panel->measurement_amp_label), amp_text);
+    gtk_label_set_text(GTK_LABEL(panel->measurement_bph_label), bph_text);
+}
+
+static void on_capture_clicked(GtkButton *button, gpointer user_data) {
+    (void)button;
+    GtkWidget *widget = GTK_WIDGET(user_data);
+    ln_station_capture_begin();
+    ln_station_panel_refresh_measurement(widget);
+    ln_station_panel_set_status(widget, "Capture started -- keep the watch steady until the hold completes.");
+}
+
+void ln_station_panel_bind_capture(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    if (!panel || !panel->capture_button) return;
+    g_signal_connect(panel->capture_button, "clicked", G_CALLBACK(on_capture_clicked), widget);
 }
 
 void ln_station_panel_bind_actions(GtkWidget *widget, GCallback save_callback, GCallback next_callback, GCallback complete_callback, gpointer user_data) {

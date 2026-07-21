@@ -52,6 +52,27 @@ typedef struct {
     char signature_b64[128];
 } LnMeasurementSignature;
 
+/* Status of the gated sample-capture window shown in the LN station
+ * panel's MEASUREMENT card. Separate from (and does not affect) the
+ * always-on rate-only hold indicator driven by ln_station_qa_update_rate
+ * -- that one feeds the top-bar "pos ... +-Ns / check" readout and keeps
+ * running regardless of whether a capture has been started. This one
+ * only accumulates once ln_station_capture_begin() has been called (via
+ * the panel's Start Capture button, or automatically on a position
+ * change once auto mode has latched), logs every valid sample taken
+ * during the hold window, and reports a running average. */
+typedef struct {
+    int active;
+    int complete;
+    double elapsed_seconds;
+    int required_seconds;
+    int sample_count;
+    double avg_rate_s_per_day;
+    double avg_beat_error_ms;
+    double avg_amplitude_deg;
+    double avg_bph;
+} LnCaptureStatus;
+
 void ln_station_init(LnStationContext *ctx);
 void ln_station_set_identity(LnStationContext *ctx, const char *identity_id);
 void ln_station_set_operator(LnStationContext *ctx, const char *operator_id);
@@ -71,6 +92,15 @@ int ln_station_current_qa_rate_limit(void);
 void ln_station_qa_update_rate(double rate_s_per_day, int valid);
 int ln_station_position_qa_passed(void);
 double ln_station_position_qa_seconds(void);
+
+/* Sample-capture window (see LnCaptureStatus above). Duration is looked
+ * up per QA standard (set via ln_station_set_qa_standard) rather than a
+ * single fixed constant -- stricter certification tiers hold for longer. */
+void ln_station_capture_begin(void);
+void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double amplitude_deg, double bph, int valid);
+void ln_station_capture_status(LnCaptureStatus *out);
+int ln_station_capture_is_auto(void);
+int ln_station_current_qa_hold_seconds(void);
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len);
 int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len);

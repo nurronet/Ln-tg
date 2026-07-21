@@ -16,6 +16,7 @@ static char ln_station_global_temperature_condition[32] = "Room / 23C";
 static char ln_station_global_measurement_type[48] = "Initial Certification";
 static int ln_station_global_followup_mode = 0;
 static int ln_station_global_qa_limit = 20;
+static int ln_station_global_qa_hold_seconds = 8;
 
 typedef struct {
     char position[32];
@@ -28,6 +29,25 @@ typedef struct {
 static LnStationBaseline ln_station_baselines[6];
 static time_t ln_station_qa_started_at = 0;
 static int ln_station_qa_passed = 0;
+
+/* Sample-capture window state -- see LnCaptureStatus in ln_station.h.
+ * 400 samples covers the longest hold (Observatory, 20s) several times
+ * over even at a fast tick rate; capture simply stops appending past
+ * that rather than growing unbounded. */
+#define LN_STATION_MAX_CAPTURE_SAMPLES 400
+typedef struct {
+    double rate_s_per_day;
+    double beat_error_ms;
+    double amplitude_deg;
+    double bph;
+} LnCaptureSample;
+static LnCaptureSample ln_station_capture_samples[LN_STATION_MAX_CAPTURE_SAMPLES];
+static int ln_station_capture_sample_count = 0;
+static int ln_station_capture_active = 0;
+static int ln_station_capture_auto_mode = 0;
+static time_t ln_station_capture_started_at = 0;
+
+static void ln_station_capture_reset_for_new_position(void);
 
 static void safe_copy(char *dst, unsigned long dst_len, const char *src) {
     if (!dst || dst_len == 0) return;
@@ -165,6 +185,7 @@ void ln_station_set_position(LnStationContext *ctx, const char *position) {
     safe_copy(ln_station_global_position, sizeof(ln_station_global_position), ctx->position);
     ln_station_qa_started_at = 0;
     ln_station_qa_passed = 0;
+    ln_station_capture_reset_for_new_position();
 }
 
 const char *ln_station_current_position(void) {
@@ -176,14 +197,22 @@ void ln_station_set_qa_standard(const char *standard) {
 
     safe_copy(ln_station_global_qa_standard, sizeof(ln_station_global_qa_standard), standard);
 
-    if (strcmp(standard, "Observatory") == 0)
+    /* Hold duration scales with strictness, same direction as the rate
+     * tolerance tightening: a tier demanding +-2 s/day should also demand
+     * a longer stable hold than one accepting +-20 s/day. */
+    if (strcmp(standard, "Observatory") == 0) {
         ln_station_global_qa_limit = 2;
-    else if (strcmp(standard, "Signature") == 0)
+        ln_station_global_qa_hold_seconds = 20;
+    } else if (strcmp(standard, "Signature") == 0) {
         ln_station_global_qa_limit = 5;
-    else if (strcmp(standard, "Precision") == 0)
+        ln_station_global_qa_hold_seconds = 15;
+    } else if (strcmp(standard, "Precision") == 0) {
         ln_station_global_qa_limit = 10;
-    else
+        ln_station_global_qa_hold_seconds = 10;
+    } else {
         ln_station_global_qa_limit = 20;
+        ln_station_global_qa_hold_seconds = 8;
+    }
 
     ln_station_qa_started_at = 0;
     ln_station_qa_passed = 0;
@@ -191,6 +220,10 @@ void ln_station_set_qa_standard(const char *standard) {
 
 const char *ln_station_current_qa_standard(void) {
     return ln_station_global_qa_standard[0] ? ln_station_global_qa_standard : "Workshop";
+}
+
+int ln_station_current_qa_hold_seconds(void) {
+    return ln_station_global_qa_hold_seconds;
 }
 
 void ln_station_set_temperature_condition(const char *temperature_condition) {
@@ -278,6 +311,85 @@ double ln_station_position_qa_seconds(void) {
     if (!ln_station_qa_started_at)
         return 0.0;
     return difftime(time(NULL), ln_station_qa_started_at);
+}
+
+/* Called from ln_station_set_position on every position change. Always
+ * clears the window (a capture from the previous position must never
+ * bleed into the next one's average) and, once auto mode has latched
+ * (i.e. Start Capture has been pressed at least once this session),
+ * immediately re-arms capture for the new position with no button press
+ * required. */
+static void ln_station_capture_reset_for_new_position(void) {
+    ln_station_capture_sample_count = 0;
+    ln_station_capture_started_at = 0;
+    ln_station_capture_active = ln_station_capture_auto_mode;
+}
+
+void ln_station_capture_begin(void) {
+    ln_station_capture_sample_count = 0;
+    ln_station_capture_started_at = 0;
+    ln_station_capture_active = 1;
+    ln_station_capture_auto_mode = 1;
+}
+
+void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double amplitude_deg, double bph, int valid) {
+    time_t now_t;
+
+    if (!ln_station_capture_active) return;
+
+    if (!valid) {
+        /* Dropped/invalid reading mid-hold -- the window must restart
+         * from a genuinely continuous stable read, same principle as the
+         * always-on rate hold indicator. */
+        ln_station_capture_sample_count = 0;
+        ln_station_capture_started_at = 0;
+        return;
+    }
+
+    now_t = time(NULL);
+    if (!ln_station_capture_started_at)
+        ln_station_capture_started_at = now_t;
+
+    if (ln_station_capture_sample_count < LN_STATION_MAX_CAPTURE_SAMPLES) {
+        LnCaptureSample *s = &ln_station_capture_samples[ln_station_capture_sample_count];
+        s->rate_s_per_day = rate_s_per_day;
+        s->beat_error_ms = beat_error_ms;
+        s->amplitude_deg = amplitude_deg;
+        s->bph = bph;
+        ln_station_capture_sample_count++;
+    }
+}
+
+void ln_station_capture_status(LnCaptureStatus *out) {
+    int i;
+    double sum_rate = 0.0, sum_be = 0.0, sum_amp = 0.0, sum_bph = 0.0;
+
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+    out->active = ln_station_capture_active;
+    out->required_seconds = ln_station_global_qa_hold_seconds;
+    out->sample_count = ln_station_capture_sample_count;
+    out->elapsed_seconds = ln_station_capture_started_at ? difftime(time(NULL), ln_station_capture_started_at) : 0.0;
+    out->complete = ln_station_capture_active && ln_station_capture_sample_count > 0
+                    && out->elapsed_seconds >= (double)ln_station_global_qa_hold_seconds;
+
+    for (i = 0; i < ln_station_capture_sample_count; i++) {
+        sum_rate += ln_station_capture_samples[i].rate_s_per_day;
+        sum_be += ln_station_capture_samples[i].beat_error_ms;
+        sum_amp += ln_station_capture_samples[i].amplitude_deg;
+        sum_bph += ln_station_capture_samples[i].bph;
+    }
+    if (ln_station_capture_sample_count > 0) {
+        out->avg_rate_s_per_day = sum_rate / ln_station_capture_sample_count;
+        out->avg_beat_error_ms = sum_be / ln_station_capture_sample_count;
+        out->avg_amplitude_deg = sum_amp / ln_station_capture_sample_count;
+        out->avg_bph = sum_bph / ln_station_capture_sample_count;
+    }
+}
+
+int ln_station_capture_is_auto(void) {
+    return ln_station_capture_auto_mode;
 }
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len) {

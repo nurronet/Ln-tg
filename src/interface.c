@@ -700,15 +700,37 @@ static bool build_ln_timing_result_from_active_snapshot(struct main_window *w, L
     compute_results(snapshot);
 
     memset(out, 0, sizeof(*out));
+    out->lift_angle_deg = snapshot->la;
+    out->sample_rate_hz = snapshot->sample_rate;
+    ln_station_timestamp_iso(out->timestamp_iso, sizeof(out->timestamp_iso));
+
+    {
+        LnCaptureStatus capture;
+        ln_station_capture_status(&capture);
+        if (capture.complete) {
+            /* Prefer the averaged, logged capture window over the
+             * instantaneous live reading -- this is the whole point of
+             * the Start Capture / hold-and-average workflow. */
+            out->rate_s_per_day = capture.avg_rate_s_per_day;
+            out->beat_error_ms = capture.avg_beat_error_ms;
+            out->amplitude_deg = capture.avg_amplitude_deg;
+            out->beat_frequency_bph = capture.avg_bph;
+            out->duration_seconds = capture.elapsed_seconds;
+            snprintf(out->notes, sizeof(out->notes),
+                     "Averaged over %d samples across %.0fs capture window", capture.sample_count, capture.elapsed_seconds);
+            return true;
+        }
+    }
+
+    /* No completed capture for this position -- fall back to the
+     * instantaneous live reading (manual save without using Start
+     * Capture, matching this function's original behavior). */
     out->rate_s_per_day = snapshot->rate;
     out->beat_error_ms = snapshot->be;
     out->amplitude_deg = snapshot->amp;
     out->beat_frequency_bph = snapshot->bph ? snapshot->bph : snapshot->guessed_bph;
-    out->lift_angle_deg = snapshot->la;
-    out->sample_rate_hz = snapshot->sample_rate;
     out->duration_seconds = 0.0;
-    ln_station_timestamp_iso(out->timestamp_iso, sizeof(out->timestamp_iso));
-    snprintf(out->notes, sizeof(out->notes), "Saved from Tg real-time display");
+    snprintf(out->notes, sizeof(out->notes), "Saved from Tg real-time display (no completed capture window)");
     return true;
 }
 
@@ -1156,6 +1178,7 @@ static void init_main_window(struct main_window *w)
 	gtk_widget_set_sensitive(w->close_all_item, FALSE);
 
 	ln_station_panel_bind_actions(ln_panel, G_CALLBACK(save_ln_timing_json_button), NULL, G_CALLBACK(complete_ln_session_button), w);
+	ln_station_panel_bind_capture(ln_panel);
 
 	// ... Quit
 	GtkWidget *quit_item = gtk_menu_item_new_with_label("Quit");
@@ -1215,6 +1238,15 @@ guint refresh(struct main_window *w)
 	}
 	unlock_computer(w->computer);
 	refresh_results(w);
+
+	if (ln_panel_widget) {
+		struct snapshot *snst = w->active_snapshot;
+		int valid = snst && !snst->calibrate && snst->pb;
+		double bph_value = snst ? (snst->bph ? snst->bph : snst->guessed_bph) : 0;
+		ln_station_capture_feed(valid ? snst->rate : 0, valid ? snst->be : 0, valid ? snst->amp : 0, bph_value, valid);
+		ln_station_panel_refresh_measurement(ln_panel_widget);
+	}
+
 	op_set_snapshot(w->active_panel, w->active_snapshot);
 
 	int p = gtk_notebook_get_current_page(GTK_NOTEBOOK(w->notebook));
