@@ -41,12 +41,13 @@ typedef struct {
     GtkWidget *erp_button;
     GtkWidget *bench_label;
     LnErpConfig erp_config;
-    unsigned int completed_mask;
     GtkWidget *measurement_rate_label;
     GtkWidget *measurement_be_label;
     GtkWidget *measurement_amp_label;
     GtkWidget *measurement_bph_label;
     GtkWidget *capture_button;
+    GtkWidget *positions_completed_label;
+    GtkWidget *stats_label;
 } LnStationPanel;
 
 static void ln_station_panel_install_css(void) {
@@ -105,21 +106,58 @@ static GtkWidget *make_card(const char *title_text) {
     return card;
 }
 
+/* Refreshes the POSITIONS list (icon + captured data per row, matching
+ * the actual stored LnPositionResult rather than just "was Next Position
+ * clicked past it"), the "Positions X / 6 completed" counter, and the
+ * ACROSS POSITIONS card's delta/average/min/max/median summary. All
+ * three are driven by the same per-position result data, so they refresh
+ * together whenever a capture completes or the position changes. */
 static void refresh_position_rows(LnStationPanel *panel) {
     int active = gtk_combo_box_get_active(GTK_COMBO_BOX(panel->position_combo));
+    int completed_count = 0;
+
     for (int i = 0; i < LN_POSITION_COUNT; i++) {
         GtkStyleContext *ctx = gtk_widget_get_style_context(panel->position_rows[i]);
+        LnPositionResult result;
+        int has_result = ln_station_get_position_result(LN_POSITIONS[i], &result);
+        char status_text[64];
+
         if (i == active)
             gtk_style_context_add_class(ctx, "lnws-position-active");
         else
             gtk_style_context_remove_class(ctx, "lnws-position-active");
 
-        if (panel->completed_mask & (1u << i))
-            gtk_label_set_text(GTK_LABEL(panel->position_status[i]), "✓");
-        else if (i == active)
-            gtk_label_set_text(GTK_LABEL(panel->position_status[i]), "▶");
-        else
-            gtk_label_set_text(GTK_LABEL(panel->position_status[i]), "○");
+        if (has_result) {
+            completed_count++;
+            snprintf(status_text, sizeof(status_text), "✓  %+.1f s/d", result.rate_s_per_day);
+        } else if (i == active) {
+            snprintf(status_text, sizeof(status_text), "▶");
+        } else {
+            snprintf(status_text, sizeof(status_text), "○");
+        }
+        gtk_label_set_text(GTK_LABEL(panel->position_status[i]), status_text);
+    }
+
+    if (panel->positions_completed_label) {
+        char positions_text[64];
+        snprintf(positions_text, sizeof(positions_text), "Positions      %d / %d completed", completed_count, LN_POSITION_COUNT);
+        gtk_label_set_text(GTK_LABEL(panel->positions_completed_label), positions_text);
+    }
+
+    if (panel->stats_label) {
+        LnPositionRateStats stats;
+        ln_station_position_rate_stats(&stats);
+        if (stats.count > 0) {
+            char stats_text[256];
+            snprintf(stats_text, sizeof(stats_text),
+                     "Rate across %d position%s (s/d)\nDelta   %+.1f\nAverage %+.1f\nMin     %+.1f\nMax     %+.1f\nMedian  %+.1f",
+                     stats.count, stats.count == 1 ? "" : "s",
+                     stats.delta_rate_s_per_day, stats.avg_rate_s_per_day,
+                     stats.min_rate_s_per_day, stats.max_rate_s_per_day, stats.median_rate_s_per_day);
+            gtk_label_set_text(GTK_LABEL(panel->stats_label), stats_text);
+        } else {
+            gtk_label_set_text(GTK_LABEL(panel->stats_label), "No completed positions yet.");
+        }
     }
 }
 
@@ -492,7 +530,20 @@ void ln_station_panel_advance_position(GtkWidget *widget) {
 
     int active = gtk_combo_box_get_active(GTK_COMBO_BOX(panel->position_combo));
     if (active < 0) active = 0;
-    panel->completed_mask |= (1u << active);
+
+    if (active == LN_POSITION_COUNT - 1) {
+        /* Last position -- nothing left to advance to. Wrapping back to
+         * position 1 here would silently start a new capture over
+         * whatever that position already recorded. Stop sampling instead
+         * and leave the reading as-is, ready for Save Reading / Complete
+         * Session. */
+        ln_station_capture_stop();
+        refresh_position_rows(panel);
+        ln_station_panel_refresh_measurement(widget);
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "All positions captured. Save this reading, then Complete Session.");
+        return;
+    }
+
     active = (active + 1) % LN_POSITION_COUNT;
     gtk_combo_box_set_active(GTK_COMBO_BOX(panel->position_combo), active);
     refresh_position_rows(panel);
@@ -607,16 +658,16 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     GtkWidget *session_card = make_card("▣  SESSION");
     GtkWidget *session_id = gtk_label_new("Session ID     LN-TIME-auto");
     GtkWidget *started = gtk_label_new("Started        Current run");
-    GtkWidget *positions = gtk_label_new("Positions      0 / 6 completed");
+    panel->positions_completed_label = gtk_label_new("Positions      0 / 6 completed");
     add_class(session_id, "lnws-muted");
     add_class(started, "lnws-muted");
-    add_class(positions, "lnws-value");
+    add_class(panel->positions_completed_label, "lnws-value");
     gtk_widget_set_halign(session_id, GTK_ALIGN_START);
     gtk_widget_set_halign(started, GTK_ALIGN_START);
-    gtk_widget_set_halign(positions, GTK_ALIGN_START);
+    gtk_widget_set_halign(panel->positions_completed_label, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(session_card), session_id, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(session_card), started, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(session_card), positions, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(session_card), panel->positions_completed_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), session_card, FALSE, FALSE, 0);
 
     GtkWidget *positions_card = make_card("⚑  POSITIONS (6)");
@@ -638,6 +689,14 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
         panel->position_status[i] = status;
     }
     gtk_box_pack_start(GTK_BOX(root), positions_card, FALSE, FALSE, 0);
+
+    GtkWidget *stats_card = make_card("▤  ACROSS POSITIONS");
+    panel->stats_label = gtk_label_new("No completed positions yet.");
+    add_class(panel->stats_label, "lnws-muted");
+    gtk_widget_set_halign(panel->stats_label, GTK_ALIGN_START);
+    gtk_label_set_line_wrap(GTK_LABEL(panel->stats_label), TRUE);
+    gtk_box_pack_start(GTK_BOX(stats_card), panel->stats_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), stats_card, FALSE, FALSE, 0);
 
     GtkWidget *measurement_card = make_card("⌁  MEASUREMENT");
     panel->measurement_rate_label = gtk_label_new("Rate              waiting");
@@ -734,6 +793,11 @@ void ln_station_panel_refresh_measurement(GtkWidget *widget) {
     if (!panel) return;
     ln_station_capture_status(&status);
 
+    /* A capture can complete without the position ever changing, so the
+     * POSITIONS list / completed count / cross-position stats need to
+     * refresh here too, not just on the position-change signal path. */
+    refresh_position_rows(panel);
+
     if (status.pending) {
         snprintf(rate_text, sizeof(rate_text), "Rate              repositioning... (%.0fs)", status.pending_seconds_remaining);
         gtk_label_set_text(GTK_LABEL(panel->measurement_rate_label), rate_text);
@@ -799,6 +863,13 @@ void ln_station_panel_bind_capture(GtkWidget *widget) {
     LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
     if (!panel || !panel->capture_button) return;
     g_signal_connect(panel->capture_button, "clicked", G_CALLBACK(on_capture_clicked), widget);
+}
+
+void ln_station_panel_reset_session(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    if (!panel) return;
+    ln_station_position_results_reset();
+    refresh_position_rows(panel);
 }
 
 void ln_station_panel_bind_actions(GtkWidget *widget, GCallback save_callback, GCallback next_callback, GCallback complete_callback, gpointer user_data) {

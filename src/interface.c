@@ -821,6 +821,14 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 		return;
 	}
 
+	/* The local copy succeeding means this reading is archived and the
+	 * operator has chosen to end the session here -- clear the
+	 * per-position results now so the next watch's POSITIONS list and
+	 * ACROSS POSITIONS stats start clean rather than mixing in this
+	 * watch's data. */
+	if (ln_panel_widget)
+		ln_station_panel_reset_session(ln_panel_widget);
+
 	char response[4096];
 	int submit_rc = ln_station_submit_result(&ln_ctx, &result, response, sizeof(response));
 

@@ -30,6 +30,12 @@ void ln_station_panel_bind_capture(GtkWidget *panel);
  * begin+refresh+status-message sequence. */
 void ln_station_panel_trigger_capture(GtkWidget *panel);
 
+/* Clears all per-position results and refreshes the POSITIONS list /
+ * ACROSS POSITIONS stats. Call when a session genuinely ends (e.g. after
+ * Complete Session succeeds) so the next watch's positions and stats
+ * don't start out mixed with the previous one's. */
+void ln_station_panel_reset_session(GtkWidget *panel);
+
 #ifdef __cplusplus
 }
 #endif

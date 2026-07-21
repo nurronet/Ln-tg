@@ -2,6 +2,7 @@
 
 #include <curl/curl.h>
 #include <glib.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,12 +50,30 @@ typedef struct {
  * operator is pressing the button because they're already in position. */
 #define LN_STATION_CAPTURE_REPOSITION_DELAY_SECONDS 5
 
+/* A reading this far out, or a tick-to-tick jump this large, means the
+ * mount is still settling (or something's actually wrong) rather than a
+ * genuinely stable position -- refuse to start or continue accumulating
+ * on it, same as any other "invalid" reading. */
+#define LN_STATION_CAPTURE_MAX_ABS_RATE_S_PER_DAY 50.0
+#define LN_STATION_CAPTURE_MAX_RATE_DELTA_S_PER_DAY 10.0
+
 static LnCaptureSample ln_station_capture_samples[LN_STATION_MAX_CAPTURE_SAMPLES];
 static int ln_station_capture_sample_count = 0;
 static int ln_station_capture_active = 0;
+static int ln_station_capture_finished = 0;
 static int ln_station_capture_auto_mode = 0;
 static time_t ln_station_capture_started_at = 0;
 static time_t ln_station_capture_auto_start_at = 0;
+static double ln_station_capture_last_rate = 0.0;
+static int ln_station_capture_has_last_rate = 0;
+
+/* Per-position frozen results, keyed by position name like
+ * ln_station_baselines already is. */
+typedef struct {
+    char position[32];
+    LnPositionResult result;
+} LnStationPositionResultSlot;
+static LnStationPositionResultSlot ln_station_position_results[6];
 
 static void ln_station_capture_reset_for_new_position(void);
 
@@ -333,6 +352,8 @@ static void ln_station_capture_reset_for_new_position(void) {
     ln_station_capture_sample_count = 0;
     ln_station_capture_started_at = 0;
     ln_station_capture_active = 0;
+    ln_station_capture_finished = 0;
+    ln_station_capture_has_last_rate = 0;
     ln_station_capture_auto_start_at = ln_station_capture_auto_mode
         ? time(NULL) + LN_STATION_CAPTURE_REPOSITION_DELAY_SECONDS
         : 0;
@@ -342,14 +363,58 @@ void ln_station_capture_begin(void) {
     ln_station_capture_sample_count = 0;
     ln_station_capture_started_at = 0;
     ln_station_capture_active = 1;
+    ln_station_capture_finished = 0;
+    ln_station_capture_has_last_rate = 0;
     ln_station_capture_auto_mode = 1;
     /* A manual press means the operator is already in position now --
      * no reason to make them wait out the reposition delay too. */
     ln_station_capture_auto_start_at = 0;
 }
 
+void ln_station_capture_stop(void) {
+    ln_station_capture_active = 0;
+    ln_station_capture_auto_start_at = 0;
+}
+
+/* Records the just-finished window's average under the current position
+ * name, keyed the same way ln_station_baselines already is: reuse an
+ * existing slot for this position if present, otherwise the first empty
+ * one. Called once, the instant a window transitions to finished. */
+static void ln_station_position_results_store(double rate_s_per_day, double beat_error_ms,
+                                               double amplitude_deg, double bph, int sample_count) {
+    const char *position = ln_station_current_position();
+    int i;
+    int slot = -1;
+    for (i = 0; i < 6; i++) {
+        if (ln_station_position_results[i].result.has_result
+            && strcmp(ln_station_position_results[i].position, position) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (i = 0; i < 6; i++) {
+            if (!ln_station_position_results[i].result.has_result) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) return; /* six distinct positions, six slots -- should never happen */
+
+    safe_copy(ln_station_position_results[slot].position, sizeof(ln_station_position_results[slot].position), position);
+    ln_station_position_results[slot].result.has_result = 1;
+    ln_station_position_results[slot].result.rate_s_per_day = rate_s_per_day;
+    ln_station_position_results[slot].result.beat_error_ms = beat_error_ms;
+    ln_station_position_results[slot].result.amplitude_deg = amplitude_deg;
+    ln_station_position_results[slot].result.bph = bph;
+    ln_station_position_results[slot].result.sample_count = sample_count;
+}
+
 void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double amplitude_deg, double bph, int valid) {
     time_t now_t = time(NULL);
+
+    if (ln_station_capture_finished) return; /* frozen -- Recapture or a position change is required to resume */
 
     if (!ln_station_capture_active) {
         if (ln_station_capture_auto_start_at && now_t >= ln_station_capture_auto_start_at) {
@@ -360,10 +425,42 @@ void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double
         }
     }
 
+    /* Out-of-range or unstable-jump readings don't count as valid for
+     * capture purposes, same treatment as a dropped tick: the mount is
+     * still settling (or something's actually wrong), so don't start or
+     * continue accumulating on it. */
+    {
+        int had_reading = valid;
+
+        if (valid && fabs(rate_s_per_day) > LN_STATION_CAPTURE_MAX_ABS_RATE_S_PER_DAY) {
+            valid = 0;
+        }
+        if (valid && ln_station_capture_has_last_rate
+            && fabs(rate_s_per_day - ln_station_capture_last_rate) > LN_STATION_CAPTURE_MAX_RATE_DELTA_S_PER_DAY) {
+            valid = 0;
+        }
+
+        if (valid) {
+            /* Accepted -- this is the new reference the next tick's
+             * delta gets checked against. */
+            ln_station_capture_last_rate = rate_s_per_day;
+            ln_station_capture_has_last_rate = 1;
+        } else if (!had_reading) {
+            /* No underlying reading at all (dropped tick / no lock) --
+             * nothing left to compare future ticks against either. */
+            ln_station_capture_has_last_rate = 0;
+        }
+        /* else: rejected for range/delta -- deliberately keep the old
+         * last-known-good reference rather than clearing it, so a burst
+         * of noise can't let an equally bad reading right behind it
+         * slip in as the new baseline. Capture only resumes once a
+         * reading actually settles back near the last accepted value. */
+    }
+
     if (!valid) {
-        /* Dropped/invalid reading mid-hold -- the window must restart
-         * from a genuinely continuous stable read, same principle as the
-         * always-on rate hold indicator. */
+        /* Dropped/invalid/unstable reading mid-hold -- the window must
+         * restart from a genuinely continuous stable read, same
+         * principle as the always-on rate hold indicator. */
         ln_station_capture_sample_count = 0;
         ln_station_capture_started_at = 0;
         return;
@@ -380,6 +477,30 @@ void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double
         s->bph = bph;
         ln_station_capture_sample_count++;
     }
+
+    if (ln_station_capture_sample_count > 0
+        && difftime(now_t, ln_station_capture_started_at) >= (double)ln_station_global_qa_hold_seconds) {
+        /* Hold satisfied -- freeze right here rather than continuing to
+         * accumulate indefinitely. This is what "read for N seconds and
+         * average" actually means; it should stop at N, not keep
+         * drifting the average for as long as the position stays
+         * selected. */
+        int i;
+        double sum_rate = 0.0, sum_be = 0.0, sum_amp = 0.0, sum_bph = 0.0;
+        for (i = 0; i < ln_station_capture_sample_count; i++) {
+            sum_rate += ln_station_capture_samples[i].rate_s_per_day;
+            sum_be += ln_station_capture_samples[i].beat_error_ms;
+            sum_amp += ln_station_capture_samples[i].amplitude_deg;
+            sum_bph += ln_station_capture_samples[i].bph;
+        }
+        ln_station_position_results_store(sum_rate / ln_station_capture_sample_count,
+                                           sum_be / ln_station_capture_sample_count,
+                                           sum_amp / ln_station_capture_sample_count,
+                                           sum_bph / ln_station_capture_sample_count,
+                                           ln_station_capture_sample_count);
+        ln_station_capture_finished = 1;
+        ln_station_capture_active = 0;
+    }
 }
 
 void ln_station_capture_status(LnCaptureStatus *out) {
@@ -391,13 +512,12 @@ void ln_station_capture_status(LnCaptureStatus *out) {
     memset(out, 0, sizeof(*out));
 
     out->active = ln_station_capture_active;
-    out->pending = !ln_station_capture_active && ln_station_capture_auto_start_at > now_t;
+    out->pending = !ln_station_capture_active && !ln_station_capture_finished && ln_station_capture_auto_start_at > now_t;
     out->pending_seconds_remaining = out->pending ? difftime(ln_station_capture_auto_start_at, now_t) : 0.0;
     out->required_seconds = ln_station_global_qa_hold_seconds;
     out->sample_count = ln_station_capture_sample_count;
     out->elapsed_seconds = ln_station_capture_started_at ? difftime(now_t, ln_station_capture_started_at) : 0.0;
-    out->complete = ln_station_capture_active && ln_station_capture_sample_count > 0
-                    && out->elapsed_seconds >= (double)ln_station_global_qa_hold_seconds;
+    out->complete = ln_station_capture_finished;
 
     for (i = 0; i < ln_station_capture_sample_count; i++) {
         sum_rate += ln_station_capture_samples[i].rate_s_per_day;
@@ -415,6 +535,58 @@ void ln_station_capture_status(LnCaptureStatus *out) {
 
 int ln_station_capture_is_auto(void) {
     return ln_station_capture_auto_mode;
+}
+
+void ln_station_position_results_reset(void) {
+    memset(ln_station_position_results, 0, sizeof(ln_station_position_results));
+}
+
+int ln_station_get_position_result(const char *position, LnPositionResult *out) {
+    int i;
+    if (!position || !out) return 0;
+    for (i = 0; i < 6; i++) {
+        if (ln_station_position_results[i].result.has_result
+            && strcmp(ln_station_position_results[i].position, position) == 0) {
+            *out = ln_station_position_results[i].result;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ln_station_compare_double(const void *a, const void *b) {
+    double da = *(const double *)a, db = *(const double *)b;
+    return (da > db) - (da < db);
+}
+
+void ln_station_position_rate_stats(LnPositionRateStats *out) {
+    double rates[6];
+    int i, n = 0;
+
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+    for (i = 0; i < 6; i++) {
+        if (ln_station_position_results[i].result.has_result)
+            rates[n++] = ln_station_position_results[i].result.rate_s_per_day;
+    }
+    out->count = n;
+    if (n == 0) return;
+
+    qsort(rates, n, sizeof(double), ln_station_compare_double);
+
+    out->min_rate_s_per_day = rates[0];
+    out->max_rate_s_per_day = rates[n - 1];
+    out->delta_rate_s_per_day = rates[n - 1] - rates[0];
+    out->median_rate_s_per_day = (n % 2)
+        ? rates[n / 2]
+        : (rates[n / 2 - 1] + rates[n / 2]) / 2.0;
+
+    {
+        double sum = 0.0;
+        for (i = 0; i < n; i++) sum += rates[i];
+        out->avg_rate_s_per_day = sum / n;
+    }
 }
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len) {
