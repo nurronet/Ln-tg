@@ -3,6 +3,10 @@
 
 #include <stdbool.h>
 
+#ifndef LN_STATION_VERSION
+#define LN_STATION_VERSION "0.9.0"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,6 +45,12 @@ typedef struct {
     char timestamp_iso[64];
     char notes[512];
 } LnTimingResult;
+
+typedef struct {
+    char key_id[96];
+    char signer_type[32];
+    char signature_b64[128];
+} LnMeasurementSignature;
 
 void ln_station_init(LnStationContext *ctx);
 void ln_station_set_identity(LnStationContext *ctx, const char *identity_id);

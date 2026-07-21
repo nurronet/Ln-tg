@@ -7,9 +7,8 @@
 #include <string.h>
 #include <time.h>
 
-#ifndef LN_STATION_VERSION
-#define LN_STATION_VERSION "0.9.0"
-#endif
+#include "ln_canonical.h"
+#include "ln_signing.h"
 
 static char ln_station_global_position[32] = "Dial Up";
 static char ln_station_global_qa_standard[32] = "Workshop";
@@ -57,8 +56,16 @@ static void json_escape_gstring(GString *out, const char *s) {
 
 /* Shared by ln_station_export_json (local file) and ln_station_submit_result
  * (HTTP POST body) so both always serialize the ln_tg_timing_result_v1
- * schema identically. Caller owns the returned GString. */
-static GString *build_timing_result_json(const LnStationContext *ctx, const LnTimingResult *result) {
+ * schema identically. Caller owns the returned GString.
+ *
+ * `signatures`/`signature_count` are optional (pass NULL/0 for an unsigned
+ * export or submission -- the field is omitted entirely rather than sent
+ * as an empty array, matching the server's own "no signatures key present"
+ * check in _verify_measurement_signatures). This is the human-readable
+ * wire/export form; it is NOT the canonical form used for signing -- see
+ * ln_canonical_timing_result_json() for that. */
+static GString *build_timing_result_json(const LnStationContext *ctx, const LnTimingResult *result,
+                                          const LnMeasurementSignature *signatures, int signature_count) {
     GString *out = g_string_sized_new(1024);
 
     g_string_append(out, "{\n");
@@ -90,7 +97,23 @@ static GString *build_timing_result_json(const LnStationContext *ctx, const LnTi
     g_string_append_printf(out, "    \"beat_error_ms\": %.6f,\n", result->baseline_beat_error_ms);
     g_string_append_printf(out, "    \"amplitude_deg\": %.6f\n", result->baseline_amplitude_deg);
     g_string_append(out, "  },\n");
-    g_string_append(out, "  \"notes\": "); json_escape_gstring(out, result->notes); g_string_append(out, "\n");
+    if (signatures && signature_count > 0) {
+        int i;
+        g_string_append(out, "  \"notes\": "); json_escape_gstring(out, result->notes); g_string_append(out, ",\n");
+        g_string_append(out, "  \"signatures\": [\n");
+        for (i = 0; i < signature_count; i++) {
+            g_string_append(out, "    {\"key_id\": ");
+            json_escape_gstring(out, signatures[i].key_id);
+            g_string_append(out, ", \"signer_type\": ");
+            json_escape_gstring(out, signatures[i].signer_type);
+            g_string_append(out, ", \"signature_b64\": ");
+            json_escape_gstring(out, signatures[i].signature_b64);
+            g_string_append(out, i + 1 < signature_count ? "},\n" : "}\n");
+        }
+        g_string_append(out, "  ]\n");
+    } else {
+        g_string_append(out, "  \"notes\": "); json_escape_gstring(out, result->notes); g_string_append(out, "\n");
+    }
     g_string_append(out, "}\n");
 
     return out;
@@ -279,7 +302,7 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     f = fopen(path, "w");
     if (!f) return -2;
 
-    body = build_timing_result_json(ctx, result);
+    body = build_timing_result_json(ctx, result, NULL, 0);
     fputs(body->str, f);
     g_string_free(body, TRUE);
     fclose(f);
@@ -311,6 +334,169 @@ static size_t ln_response_write(void *contents, size_t size, size_t nmemb, void 
     return bytes;
 }
 
+/* Shared by ln_station_submit_result and ln_station_register_workstation_key
+ * -- both are "POST a JSON body to an ERP method, read the response" calls
+ * that otherwise duplicate the same ~20 lines of curl boilerplate. */
+static int ln_station_http_post_json(const LnStationContext *ctx, const char *method_path,
+                                      const char *json_body, char *response, unsigned long response_len) {
+    CURL *curl;
+    CURLcode curl_result;
+    struct curl_slist *headers = NULL;
+    char url[768];
+    char auth[640];
+    char user_agent[96];
+    long status = 0;
+    LnResponseBuffer resp_buf;
+
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl = curl_easy_init();
+    if (!curl) {
+        safe_copy(response, response_len, "Unable to initialize HTTP client");
+        return -2;
+    }
+
+    g_snprintf(url, sizeof(url), "%s/api/method/%s", ctx->erp_base_url, method_path);
+    g_snprintf(auth, sizeof(auth), "Authorization: token %s:%s", ctx->api_key, ctx->api_secret);
+    g_snprintf(user_agent, sizeof(user_agent), "User-Agent: LN-Watchmaker-Station/%s", LN_STATION_VERSION);
+    headers = curl_slist_append(headers, auth);
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, user_agent);
+
+    resp_buf.buffer = response;
+    resp_buf.capacity = response_len;
+    resp_buf.length = 0;
+    if (response && response_len) response[0] = '\0';
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_body));
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, ln_response_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_buf);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, ctx->verify_tls ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, ctx->verify_tls ? 2L : 0L);
+
+    curl_result = curl_easy_perform(curl);
+    if (curl_result == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    if (curl_result != CURLE_OK) {
+        safe_copy(response, response_len, curl_easy_strerror(curl_result));
+        return curl_result == CURLE_OPERATION_TIMEDOUT ? -408 : -3;
+    }
+    if (status < 200 || status >= 300) {
+        return (int)status;
+    }
+    return 0;
+}
+
+static LnSigningKeypair g_workstation_keypair;
+static int g_workstation_keypair_ready = 0;
+
+static const char *ln_station_workstation_key_path(void) {
+    static char path[1024];
+    char dir[900];
+    g_snprintf(dir, sizeof(dir), "%s%c%s", g_get_user_config_dir(), G_DIR_SEPARATOR, "ln-watchmaker-station");
+    g_mkdir_with_parents(dir, 0700);
+    g_snprintf(path, sizeof(path), "%s%c%s", dir, G_DIR_SEPARATOR, "workstation_signing_key.bin");
+    return path;
+}
+
+/* Tells the ERP about a newly-generated workstation key so custody.py's
+ * verify_signature() (and _verify_measurement_signatures(), which reuses
+ * it) can recognize it. Not fatal if this fails -- the key still signs
+ * fine locally, it just won't verify as "Verified" server-side until
+ * registration succeeds (e.g. custody.register_key can be called again
+ * later, or an admin registers it manually). Known limitation: if the
+ * local key file is ever lost, a freshly generated replacement will reuse
+ * the same deterministic key_id but a different public key, and the ERP
+ * will reject the second registration ("Key ID already exists") --
+ * recovering from that needs an admin to update/revoke the old
+ * LN Signing Key record. Out of scope for this workstation-only first
+ * pass; not solved here. */
+static int ln_station_register_workstation_key(const LnStationContext *ctx, const LnSigningKeypair *keypair,
+                                                char *error, size_t error_len) {
+    char public_key_b64[128];
+    char body[512];
+    char response[2048];
+    int rc;
+
+    if (ln_signing_public_key_base64(keypair, public_key_b64, sizeof(public_key_b64)) != 0) {
+        safe_copy(error, error_len, "Unable to encode workstation public key");
+        return -1;
+    }
+
+    g_snprintf(body, sizeof(body),
+               "{\"key_id\":\"%s\",\"owner_type\":\"Workstation\",\"public_key_b64\":\"%s\"}",
+               keypair->key_id, public_key_b64);
+
+    rc = ln_station_http_post_json(ctx, "ln_watch_inventory.custody.register_key", body, response, sizeof(response));
+    if (rc != 0) {
+        safe_copy(error, error_len, response[0] ? response : "Unknown error registering workstation key");
+        return rc;
+    }
+    return 0;
+}
+
+/* Loads the station's persistent signing key, generating and registering
+ * one on first use. Cached for the process lifetime -- safe to call before
+ * every submission. Failure here is never fatal to the submission itself;
+ * callers fall back to submitting unsigned (matches today's behavior)
+ * rather than blocking the whole measurement pipeline over a signing
+ * hiccup, consistent with how a failed ERP submit already falls back to
+ * "JSON export only" elsewhere in this file. */
+static int ln_station_ensure_workstation_key(const LnStationContext *ctx, char *error, size_t error_len) {
+    const char *path;
+    char key_id[96];
+
+    if (g_workstation_keypair_ready) return 0;
+
+    if (ln_signing_init() != 0) {
+        safe_copy(error, error_len, "Unable to initialize signing library");
+        return -1;
+    }
+
+    g_snprintf(key_id, sizeof(key_id), "%s-workstation", ctx->station_id[0] ? ctx->station_id : "LN-TG-001");
+    path = ln_station_workstation_key_path();
+
+    if (ln_signing_load_private_key(&g_workstation_keypair, path, key_id) == 0) {
+        g_workstation_keypair_ready = 1;
+        return 0;
+    }
+
+    if (ln_signing_generate(&g_workstation_keypair, key_id) != 0) {
+        safe_copy(error, error_len, "Unable to generate workstation signing key");
+        return -1;
+    }
+    if (ln_signing_save_private_key(&g_workstation_keypair, path) != 0) {
+        safe_copy(error, error_len, "Unable to save workstation signing key");
+        return -1;
+    }
+
+    {
+        char register_error[512] = "";
+        if (ln_station_register_workstation_key(ctx, &g_workstation_keypair, register_error, sizeof(register_error)) != 0) {
+            fprintf(stderr, "[LNWS SIGN] WARNING: workstation key registration failed, submissions will sign but may not verify until this succeeds: %s\n",
+                    register_error);
+            fflush(stderr);
+        } else {
+            fprintf(stderr, "[LNWS SIGN] Registered new workstation signing key '%s'\n", key_id);
+            fflush(stderr);
+        }
+    }
+
+    g_workstation_keypair_ready = 1;
+    return 0;
+}
+
 int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len) {
     CURL *curl;
     CURLcode curl_result;
@@ -323,6 +509,8 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
     double total_seconds = 0.0;
     double connect_seconds = 0.0;
     LnResponseBuffer resp_buf;
+    LnMeasurementSignature signature;
+    int signature_count = 0;
 
     if (!ctx || !result) return -1;
     if (!ctx->submit_enabled) {
@@ -338,6 +526,37 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
         return -1;
     }
 
+    /* Sign with the workstation's own key (operator signing is a separate,
+     * later piece -- this submission will carry only one of the two
+     * signatures custody.py's verification wants, so the server-side
+     * verification_status will show "Invalid" rather than "Verified"
+     * until operator credentials exist. That's an accurate, expected
+     * interim state, not a bug: see docs/architecture-debt-map.md's
+     * custody ledger notes. A signing failure here is not fatal to the
+     * submission -- it just falls back to submitting unsigned. */
+    memset(&signature, 0, sizeof(signature));
+    {
+        char sign_error[256] = "";
+
+        if (ln_station_ensure_workstation_key(ctx, sign_error, sizeof(sign_error)) == 0 && g_workstation_keypair_ready) {
+            GString *canonical = ln_canonical_timing_result_json(ctx, result);
+            if (ln_signing_sign_base64(&g_workstation_keypair, (const unsigned char *)canonical->str, canonical->len,
+                                        signature.signature_b64, sizeof(signature.signature_b64)) == 0) {
+                safe_copy(signature.key_id, sizeof(signature.key_id), g_workstation_keypair.key_id);
+                safe_copy(signature.signer_type, sizeof(signature.signer_type), "Workstation");
+                signature_count = 1;
+            } else {
+                fprintf(stderr, "[LNWS SIGN] WARNING: failed to sign timing result, submitting unsigned\n");
+                fflush(stderr);
+            }
+            g_string_free(canonical, TRUE);
+        } else {
+            fprintf(stderr, "[LNWS SIGN] WARNING: workstation key unavailable (%s), submitting unsigned\n",
+                    sign_error[0] ? sign_error : "unknown error");
+            fflush(stderr);
+        }
+    }
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
     if (!curl) {
@@ -345,7 +564,7 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
         return -2;
     }
 
-    body = build_timing_result_json(ctx, result);
+    body = build_timing_result_json(ctx, result, signature_count > 0 ? &signature : NULL, signature_count);
 
     g_snprintf(url, sizeof(url), "%s/api/method/ln_watch_inventory.freeerp.submit_timing_result", ctx->erp_base_url);
     g_snprintf(auth, sizeof(auth), "Authorization: token %s:%s", ctx->api_key, ctx->api_secret);
@@ -372,7 +591,8 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, ctx->verify_tls ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, ctx->verify_tls ? 2L : 0L);
 
-    fprintf(stderr, "[LNWS SUBMIT] POST %s (identity=%s position=%s)\n", url, ctx->identity_id, ctx->position);
+    fprintf(stderr, "[LNWS SUBMIT] POST %s (identity=%s position=%s, %s)\n", url, ctx->identity_id, ctx->position,
+            signature_count > 0 ? "signed" : "unsigned");
     fflush(stderr);
 
     curl_result = curl_easy_perform(curl);

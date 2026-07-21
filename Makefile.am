@@ -18,7 +18,11 @@ tg_timer_SOURCES = src/algo.c \
  src/ln_station_panel.h \
  src/ln_erp_config.c \
  src/ln_erp_config.h \
- src/tg.h 
+ src/ln_signing.c \
+ src/ln_signing.h \
+ src/ln_canonical.c \
+ src/ln_canonical.h \
+ src/tg.h
 
 tg_timer_dbg_SOURCES = $(tg_timer_SOURCES)
 tg_timer_prf_SOURCES = $(tg_timer_SOURCES)
@@ -29,6 +33,7 @@ LIBS = $(GTK_LIBS) \
  $(PORTAUDIO_LIBS) \
  $(FFTW_LIBS) \
  $(CURL_LIBS) \
+ $(SODIUM_LIBS) \
  -lpthread \
  -lm
 
@@ -39,7 +44,8 @@ AM_CFLAGS = $(GTK_CFLAGS) \
  $(GTHREAD_CFLAGS) \
  $(PORTAUDIO_CFLAGS) \
  $(FFTW_CFLAGS) \
- $(CURL_CFLAGS)
+ $(CURL_CFLAGS) \
+ $(SODIUM_CFLAGS)
 
 tg_timer_dbg_CFLAGS = $(AM_CFLAGS) -ggdb
 tg_timer_prf_CFLAGS = $(AM_CFLAGS) -pg
