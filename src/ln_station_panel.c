@@ -44,7 +44,16 @@ typedef struct {
     GtkWidget *capture_button;
     GtkWidget *positions_completed_label;
     GtkWidget *stats_label;
+    /* Whatever identity the reset-on-change logic last saw, so retrying a
+     * lookup (e.g. after a network blip) on the SAME identity doesn't wipe
+     * in-progress capture data -- only a genuinely different value should
+     * trigger a reset. See lookup_identity_now(). */
+    char last_confirmed_identity[128];
 } LnStationPanel;
+
+/* Defined further down (needs refresh_position_rows/refresh_measurement);
+ * forward-declared so lookup_identity_now() can call it. */
+static void reset_session_state(LnStationPanel *panel, int clear_identity_entry);
 
 static void ln_station_panel_install_css(void) {
     static int installed = 0;
@@ -312,7 +321,24 @@ cleanup:
 static void lookup_identity_now(LnStationPanel *panel, const char *identity) {
     char response[16384];
     int rc;
-    if (!panel || !identity || !*identity || !panel->erp_config.enabled) return;
+    if (!panel || !identity || !*identity) return;
+
+    /* A genuinely different identity than the last one confirmed here means
+     * a new physical unit is on the bench -- reset before doing anything
+     * else (including the ERP lookup below, which may be disabled or fail;
+     * the reset itself doesn't depend on ERP at all). Comparing against
+     * last_confirmed_identity rather than ctx->identity_id specifically:
+     * ctx->identity_id is updated on every keystroke by on_identity_changed,
+     * so by the time this runs it already equals `identity` and would make
+     * the comparison useless. Retrying a lookup on the same identity (e.g.
+     * after a network blip) must not wipe in-progress capture data, which
+     * is exactly what comparing against the last-confirmed value prevents. */
+    if (g_strcmp0(panel->last_confirmed_identity, identity) != 0) {
+        reset_session_state(panel, 0);
+        g_strlcpy(panel->last_confirmed_identity, identity, sizeof(panel->last_confirmed_identity));
+    }
+
+    if (!panel->erp_config.enabled) return;
     gtk_label_set_text(GTK_LABEL(panel->status_label), "Looking up identity in ERP...");
     rc = ln_erp_identity_lookup(&panel->erp_config, identity, response, sizeof(response));
     if (rc == 0)
@@ -867,11 +893,50 @@ void ln_station_panel_bind_capture(GtkWidget *widget) {
     g_signal_connect(panel->capture_button, "clicked", G_CALLBACK(on_capture_clicked), widget);
 }
 
-void ln_station_panel_reset_session(GtkWidget *widget) {
-    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+/* Shared by Complete Session and "the identity just changed to something
+ * new" (see lookup_identity_now) -- both mean whatever was on the bench
+ * before is gone, so position results, capture state, and the identity-
+ * derived display fields must not carry over. clear_identity_entry is only
+ * true for Complete Session: when the identity field itself just changed,
+ * it already holds the new (correct) value and must not be wiped out from
+ * under the operator who just typed/scanned it. */
+static void reset_session_state(LnStationPanel *panel, int clear_identity_entry) {
     if (!panel) return;
+
+    if (clear_identity_entry) {
+        panel->suppress_identity_change = 1;
+        gtk_entry_set_text(GTK_ENTRY(panel->identity_entry), "");
+        panel->suppress_identity_change = 0;
+        ln_station_set_identity(panel->ctx, "");
+        panel->last_confirmed_identity[0] = '\0';
+    }
+    set_readonly_entry(panel->movement_serial_entry, "");
+    set_readonly_entry(panel->movement_part_entry, "");
+    set_readonly_entry(panel->watch_unit_entry, "");
+    set_readonly_entry(panel->work_order_entry, "");
+    set_readonly_entry(panel->identity_status_entry, "");
+    panel->ctx->work_order[0] = '\0';
+
+    /* Reset to the first position. gtk_combo_box_set_active() only emits
+     * "changed" (which would otherwise drive this itself via
+     * on_position_changed) when the index actually moves, so the
+     * underlying position/capture reset is also called explicitly here to
+     * guarantee it happens even if the combo was already showing the first
+     * position. Calling it twice in the "index did move" case is harmless
+     * -- it's fully idempotent. */
+    if (panel->position_combo)
+        gtk_combo_box_set_active(GTK_COMBO_BOX(panel->position_combo), 0);
+    ln_station_set_position(panel->ctx, LN_POSITIONS[0]);
+
     ln_station_position_results_reset();
     refresh_position_rows(panel);
+    if (panel->root)
+        ln_station_panel_refresh_measurement(panel->root);
+}
+
+void ln_station_panel_reset_session(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    reset_session_state(panel, 1);
 }
 
 void ln_station_panel_bind_actions(GtkWidget *widget, GCallback save_callback, GCallback next_callback, GCallback complete_callback, gpointer user_data) {
