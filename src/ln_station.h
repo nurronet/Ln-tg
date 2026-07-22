@@ -16,6 +16,12 @@ typedef struct {
     char operator_id[64];
     char identity_id[128];
     char work_order[128];
+    /* Set from the first successful submit_timing_result() response within
+     * a multi-position session (see ln_station_extract_json_string_field())
+     * and included on every subsequent submission so the ERP links all of
+     * a watch's position readings under one LN Measurement Session instead
+     * of minting a new session per reading. Cleared between sessions. */
+    char session[96];
     char position[32];
     char qa_standard[32];
     char temperature_condition[32];
@@ -87,7 +93,15 @@ typedef struct {
     double amplitude_deg;
     double bph;
     int sample_count;
+    double elapsed_seconds;
 } LnPositionResult;
+
+/* Canonical list of the 6 station positions -- single source of truth so
+ * the panel UI, the per-position result store, and full-session export/
+ * submit all key off exactly the same strings (a mismatch here would
+ * silently fail ln_station_get_position_result() lookups). */
+#define LN_STATION_POSITION_COUNT 6
+extern const char *ln_station_position_names[LN_STATION_POSITION_COUNT];
 
 /* Cross-position summary of rate_s_per_day across every position that
  * has a completed LnPositionResult so far (not all 6 need to be done). */
@@ -145,6 +159,30 @@ void ln_station_position_rate_stats(LnPositionRateStats *out);
 
 int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len);
 int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len);
+
+/* Saves one combined JSON file covering every position with a completed
+ * result so far (see LnPositionResult) -- the "full session" archive,
+ * as opposed to ln_station_export_json's single-reading file. `positions`
+ * and `results` are parallel arrays of length `count`. */
+int ln_station_export_session_json(const LnStationContext *ctx, const char *positions[],
+                                    const LnPositionResult results[], int count,
+                                    double lift_angle_deg, double sample_rate_hz,
+                                    char *out_path, unsigned long out_path_len);
+
+/* Pulls a plain string-valued field (e.g. "session": "LN-MS-00007") out of
+ * a Frappe JSON response by substring search -- not a general JSON parser,
+ * just enough to chain submit_timing_result() calls under one session. */
+int ln_station_extract_json_string_field(const char *json, const char *key, char *out, unsigned long out_len);
+
+/* Tells the ERP a session's readings are all in, so it can aggregate them
+ * (LN Measurement Session.complete_session()) and, for a Qualification
+ * session, compute a suggested functional_grade for the movement -- see
+ * ln_measurement_session.py. Applying that suggestion to the movement
+ * record is a deliberate separate, human-confirmed step done in the ERP,
+ * not from this station -- this call only surfaces the suggestion for
+ * display. No-op (returns 1) if submission is disabled or no session was
+ * ever established (e.g. every submit in the loop failed). */
+int ln_station_complete_session(const LnStationContext *ctx, const char *session, char *response, unsigned long response_len);
 
 #ifdef __cplusplus
 }

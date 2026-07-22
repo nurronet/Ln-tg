@@ -734,6 +734,29 @@ static bool build_ln_timing_result_from_active_snapshot(struct main_window *w, L
     return true;
 }
 
+/* Builds an LnTimingResult from an already-finished position's stored
+ * average (see LnPositionResult) rather than the live snapshot -- used by
+ * "Complete Session" to save/submit every captured position, not just
+ * whichever one happened to be active when the button was pressed. */
+static void build_ln_timing_result_from_position(struct main_window *w, const char *position,
+                                                   const LnPositionResult *pos, LnTimingResult *out) {
+    struct snapshot *snapshot = w->active_snapshot;
+    compute_results(snapshot);
+
+    memset(out, 0, sizeof(*out));
+    out->lift_angle_deg = snapshot->la;
+    out->sample_rate_hz = snapshot->sample_rate;
+    ln_station_timestamp_iso(out->timestamp_iso, sizeof(out->timestamp_iso));
+    out->rate_s_per_day = pos->rate_s_per_day;
+    out->beat_error_ms = pos->beat_error_ms;
+    out->amplitude_deg = pos->amplitude_deg;
+    out->beat_frequency_bph = pos->bph;
+    out->duration_seconds = pos->elapsed_seconds;
+    snprintf(out->notes, sizeof(out->notes),
+             "Averaged over %d samples across %.0fs capture window (position: %s)",
+             pos->sample_count, pos->elapsed_seconds, position);
+}
+
 static void save_ln_timing_json(GtkMenuItem *m, struct main_window *w) {
     UNUSED(m);
 
@@ -744,7 +767,7 @@ static void save_ln_timing_json(GtkMenuItem *m, struct main_window *w) {
     char out_path[1024];
     int rc = ln_station_export_json(&ln_ctx, &result, out_path, sizeof(out_path));
     if (rc) {
-        error("Unable to save LN timing JSON. Code %d", rc);
+        error("Unable to save LN timing JSON.\n%s", out_path);
         return;
     }
 
@@ -807,17 +830,39 @@ static void save_ln_timing_json_button(GtkButton *button, struct main_window *w)
 static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 {
 	UNUSED(button);
+	int i;
 
-	LnTimingResult result;
-	if (!build_ln_timing_result_from_active_snapshot(w, &result))
+	/* Gather every position with a completed capture -- not just whichever
+	 * one happens to be active right now. This also means Complete Session
+	 * no longer requires a live signal (snapshot->pb): a watch that's
+	 * already been pulled off the mic after finishing all 6 positions can
+	 * still be saved/submitted from the stored results alone. */
+	const char *positions_present[LN_STATION_POSITION_COUNT];
+	LnPositionResult results_present[LN_STATION_POSITION_COUNT];
+	int present_count = 0;
+	for (i = 0; i < LN_STATION_POSITION_COUNT; i++) {
+		LnPositionResult pos;
+		if (ln_station_get_position_result(ln_station_position_names[i], &pos) && pos.has_result) {
+			positions_present[present_count] = ln_station_position_names[i];
+			results_present[present_count] = pos;
+			present_count++;
+		}
+	}
+	if (present_count == 0) {
+		error("No completed position readings yet -- Start Capture on at least one position before completing the session.");
 		return;
+	}
 
 	/* Always keep a local copy first: submission over the network can fail
-	 * or be disabled, but the measurement itself should never be lost. */
-	char out_path[1024];
-	int export_rc = ln_station_export_json(&ln_ctx, &result, out_path, sizeof(out_path));
-	if (export_rc) {
-		error("Unable to save LN timing JSON. Code %d", export_rc);
+	 * or be disabled, but the measurement itself should never be lost.
+	 * One combined file for the whole session, not one per position. */
+	compute_results(w->active_snapshot);
+	char session_out_path[1024];
+	int session_export_rc = ln_station_export_session_json(&ln_ctx, positions_present, results_present, present_count,
+	                                                         w->active_snapshot->la, w->active_snapshot->sample_rate,
+	                                                         session_out_path, sizeof(session_out_path));
+	if (session_export_rc) {
+		error("Unable to save LN timing session JSON.\n%s", session_out_path);
 		return;
 	}
 
@@ -829,24 +874,84 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 	if (ln_panel_widget)
 		ln_station_panel_reset_session(ln_panel_widget);
 
-	char response[4096];
-	int submit_rc = ln_station_submit_result(&ln_ctx, &result, response, sizeof(response));
+	/* Submit every captured position to the ERP, chaining them under one
+	 * LN Measurement Session: the first successful submit creates the
+	 * session and returns its name (ln_station_extract_json_string_field
+	 * pulls it out of the response), which then rides along on every
+	 * subsequent submission in ctx->session so all of them attach to that
+	 * same session instead of submit_timing_result minting a fresh one
+	 * per reading -- which is what was happening before this change, and
+	 * why only a single position was ever ending up on the ERP side. */
+	char saved_position[32];
+	g_strlcpy(saved_position, ln_station_current_position(), sizeof(saved_position));
+	ln_ctx.session[0] = '\0';
+
+	int submitted_count = 0, failed_count = 0, disabled = 0;
+	char last_response[4096] = "";
+	char failures[2048] = "";
+	for (i = 0; i < present_count; i++) {
+		LnTimingResult result;
+		build_ln_timing_result_from_position(w, positions_present[i], &results_present[i], &result);
+		ln_station_set_position(&ln_ctx, positions_present[i]);
+
+		char response[4096];
+		int submit_rc = ln_station_submit_result(&ln_ctx, &result, response, sizeof(response));
+		g_strlcpy(last_response, response, sizeof(last_response));
+
+		if (submit_rc == 0) {
+			submitted_count++;
+			if (!ln_ctx.session[0])
+				ln_station_extract_json_string_field(response, "session", ln_ctx.session, sizeof(ln_ctx.session));
+		} else if (submit_rc == 1) {
+			disabled = 1;
+		} else {
+			failed_count++;
+			char line[256];
+			g_snprintf(line, sizeof(line), "%s: submit failed (code %d)\n", positions_present[i], submit_rc);
+			g_strlcat(failures, line, sizeof(failures));
+		}
+	}
+
+	ln_station_set_position(&ln_ctx, saved_position);
+
+	/* Tell the ERP every reading is in so it can aggregate the session
+	 * and, for Qualification, compute a suggested functional_grade for
+	 * the movement. Only informational here -- applying that suggestion
+	 * to the movement record is a deliberate separate, human-confirmed
+	 * step done in the ERP, not a one-click action from this station. */
+	char completed_session[96];
+	g_strlcpy(completed_session, ln_ctx.session, sizeof(completed_session));
+	ln_ctx.session[0] = '\0';
+
+	char grade_suggestion[256] = "";
+	if (submitted_count > 0 && completed_session[0]) {
+		char complete_response[4096];
+		if (ln_station_complete_session(&ln_ctx, completed_session, complete_response, sizeof(complete_response)) == 0) {
+			char grade[64] = "";
+			char reason[192] = "";
+			ln_station_extract_json_string_field(complete_response, "suggested_functional_grade", grade, sizeof(grade));
+			ln_station_extract_json_string_field(complete_response, "suggested_grade_reason", reason, sizeof(reason));
+			if (grade[0])
+				g_snprintf(grade_suggestion, sizeof(grade_suggestion),
+					"\n\nSuggested grade: %s\n%s\n(Not applied yet -- confirm in the ERP.)", grade, reason);
+		}
+	}
 
 	GtkMessageType message_type = GTK_MESSAGE_INFO;
-	char message[4400];
-	if (submit_rc == 0) {
+	char message[4900];
+	if (disabled && submitted_count == 0 && failed_count == 0) {
 		g_snprintf(message, sizeof(message),
-			"Timing session complete and submitted to ERP.\nLocal copy: %s\n%s",
-			out_path, response[0] ? response : "");
-	} else if (submit_rc == 1) {
+			"Timing session marked complete (%d position%s).\nLocal copy: %s\nERP submission is disabled in ERP Connection settings.",
+			present_count, present_count == 1 ? "" : "s", session_out_path);
+	} else if (failed_count == 0) {
 		g_snprintf(message, sizeof(message),
-			"Timing session marked complete.\nLocal copy: %s\nERP submission is disabled in ERP Connection settings.",
-			out_path);
+			"Timing session complete: %d/%d position%s submitted to ERP.\nLocal copy: %s\n%s%s",
+			submitted_count, present_count, present_count == 1 ? "" : "s", session_out_path, last_response, grade_suggestion);
 	} else {
 		message_type = GTK_MESSAGE_WARNING;
 		g_snprintf(message, sizeof(message),
-			"Timing session marked complete, but ERP submission failed (code %d).\nLocal copy saved: %s\n%s",
-			submit_rc, out_path, response);
+			"Timing session marked complete, but %d/%d position%s failed to submit to ERP.\nLocal copy saved: %s\n%s",
+			failed_count, present_count, present_count == 1 ? "" : "s", session_out_path, failures);
 	}
 
 	GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(w->window), 0, message_type, GTK_BUTTONS_CLOSE, "%s", message);

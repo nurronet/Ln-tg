@@ -1,6 +1,7 @@
 #include "ln_station.h"
 
 #include <curl/curl.h>
+#include <errno.h>
 #include <glib.h>
 #include <math.h>
 #include <stdio.h>
@@ -18,6 +19,15 @@ static char ln_station_global_measurement_type[48] = "Initial Certification";
 static int ln_station_global_followup_mode = 0;
 static int ln_station_global_qa_limit = 20;
 static int ln_station_global_qa_hold_seconds = 8;
+
+const char *ln_station_position_names[LN_STATION_POSITION_COUNT] = {
+    "Dial Up",
+    "Dial Down",
+    "Crown Up",
+    "Crown Down",
+    "Crown Left",
+    "Crown Right"
+};
 
 typedef struct {
     char position[32];
@@ -123,6 +133,9 @@ static GString *build_timing_result_json(const LnStationContext *ctx, const LnTi
     g_string_append(out, "  \"operator_id\": "); json_escape_gstring(out, ctx->operator_id); g_string_append(out, ",\n");
     g_string_append(out, "  \"identity_id\": "); json_escape_gstring(out, ctx->identity_id); g_string_append(out, ",\n");
     g_string_append(out, "  \"work_order\": "); json_escape_gstring(out, ctx->work_order); g_string_append(out, ",\n");
+    if (ctx->session[0]) {
+        g_string_append(out, "  \"session\": "); json_escape_gstring(out, ctx->session); g_string_append(out, ",\n");
+    }
     g_string_append(out, "  \"position\": "); json_escape_gstring(out, ctx->position); g_string_append(out, ",\n");
     g_string_append(out, "  \"qa_standard\": "); json_escape_gstring(out, ln_station_current_qa_standard()); g_string_append(out, ",\n");
     g_string_append_printf(out, "  \"qa_rate_limit_s_per_day\": %d,\n", ln_station_current_qa_rate_limit());
@@ -176,6 +189,48 @@ static void now_compact(char *buf, unsigned long len) {
     gmtime_r(&t, &tmv);
 #endif
     strftime(buf, len, "%Y%m%dT%H%M%SZ", &tmv);
+}
+
+static void now_iso(char *buf, unsigned long len) {
+    time_t t = time(NULL);
+    struct tm tmv;
+#if defined(_WIN32)
+    gmtime_s(&tmv, &t);
+#else
+    gmtime_r(&t, &tmv);
+#endif
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tmv);
+}
+
+int ln_station_extract_json_string_field(const char *json, const char *key, char *out, unsigned long out_len) {
+    char needle[128];
+    const char *p;
+    const char *start;
+    const char *end;
+    unsigned long len;
+
+    if (!json || !key || !out || out_len == 0) return -1;
+    out[0] = '\0';
+
+    g_snprintf(needle, sizeof(needle), "\"%s\"", key);
+    p = strstr(json, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') return -1;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') return -1; /* only handles string-valued fields, which is all we need here */
+    p++;
+
+    start = p;
+    end = strchr(start, '"');
+    if (!end) return -1;
+    len = (unsigned long)(end - start);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return 0;
 }
 
 void ln_station_init(LnStationContext *ctx) {
@@ -381,7 +436,8 @@ void ln_station_capture_stop(void) {
  * existing slot for this position if present, otherwise the first empty
  * one. Called once, the instant a window transitions to finished. */
 static void ln_station_position_results_store(double rate_s_per_day, double beat_error_ms,
-                                               double amplitude_deg, double bph, int sample_count) {
+                                               double amplitude_deg, double bph, int sample_count,
+                                               double elapsed_seconds) {
     const char *position = ln_station_current_position();
     int i;
     int slot = -1;
@@ -409,6 +465,7 @@ static void ln_station_position_results_store(double rate_s_per_day, double beat
     ln_station_position_results[slot].result.amplitude_deg = amplitude_deg;
     ln_station_position_results[slot].result.bph = bph;
     ln_station_position_results[slot].result.sample_count = sample_count;
+    ln_station_position_results[slot].result.elapsed_seconds = elapsed_seconds;
 }
 
 void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double amplitude_deg, double bph, int valid) {
@@ -497,7 +554,8 @@ void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double
                                            sum_be / ln_station_capture_sample_count,
                                            sum_amp / ln_station_capture_sample_count,
                                            sum_bph / ln_station_capture_sample_count,
-                                           ln_station_capture_sample_count);
+                                           ln_station_capture_sample_count,
+                                           difftime(now_t, ln_station_capture_started_at));
         ln_station_capture_finished = 1;
         ln_station_capture_active = 0;
     }
@@ -597,7 +655,11 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     FILE *f;
     unsigned long i;
 
-    if (!ctx || !result || !ctx->identity_id[0]) return -1;
+    if (!ctx || !result || !ctx->identity_id[0]) {
+        if (out_path && out_path_len > 0)
+            safe_copy(out_path, out_path_len, "LN Identity not set -- scan/select an identity before saving");
+        return -1;
+    }
 
     safe_copy(safe_identity, sizeof(safe_identity), ctx->identity_id);
     for (i = 0; safe_identity[i]; i++) {
@@ -609,9 +671,98 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
     snprintf(path, sizeof(path), "%s/%s_%s.json", ctx->export_dir[0] ? ctx->export_dir : ".", safe_identity, stamp);
 
     f = fopen(path, "w");
-    if (!f) return -2;
+    if (!f) {
+        /* Surface the exact path and OS-level reason (missing directory,
+         * no write permission, etc.) rather than just a bare error code --
+         * this is the only information the operator has to self-diagnose
+         * an export-directory misconfiguration without a debug build. */
+        int saved_errno = errno;
+        if (out_path && out_path_len > 0)
+            snprintf(out_path, out_path_len, "%s (%s)", path, strerror(saved_errno));
+        return -2;
+    }
 
     body = build_timing_result_json(ctx, result, NULL, 0);
+    fputs(body->str, f);
+    g_string_free(body, TRUE);
+    fclose(f);
+
+    if (out_path && out_path_len > 0) safe_copy(out_path, out_path_len, path);
+    return 0;
+}
+
+int ln_station_export_session_json(const LnStationContext *ctx, const char *positions[],
+                                    const LnPositionResult results[], int count,
+                                    double lift_angle_deg, double sample_rate_hz,
+                                    char *out_path, unsigned long out_path_len) {
+    char stamp[32];
+    char stamp_iso[64];
+    char safe_identity[160];
+    char path[1024];
+    GString *body;
+    FILE *f;
+    unsigned long i;
+    int j;
+
+    if (!ctx || !ctx->identity_id[0] || !positions || !results || count <= 0) {
+        if (out_path && out_path_len > 0)
+            safe_copy(out_path, out_path_len, "LN Identity not set, or no completed position readings to save");
+        return -1;
+    }
+
+    safe_copy(safe_identity, sizeof(safe_identity), ctx->identity_id);
+    for (i = 0; safe_identity[i]; i++) {
+        if (safe_identity[i] == '/' || safe_identity[i] == '\\' || safe_identity[i] == ':' || safe_identity[i] == ' ')
+            safe_identity[i] = '_';
+    }
+
+    now_compact(stamp, sizeof(stamp));
+    snprintf(path, sizeof(path), "%s/%s_%s_session.json", ctx->export_dir[0] ? ctx->export_dir : ".", safe_identity, stamp);
+
+    f = fopen(path, "w");
+    if (!f) {
+        int saved_errno = errno;
+        if (out_path && out_path_len > 0)
+            snprintf(out_path, out_path_len, "%s (%s)", path, strerror(saved_errno));
+        return -2;
+    }
+
+    now_iso(stamp_iso, sizeof(stamp_iso));
+
+    body = g_string_sized_new(2048);
+    g_string_append(body, "{\n");
+    g_string_append(body, "  \"schema\": \"ln_tg_timing_session_v1\",\n");
+    g_string_append(body, "  \"station_version\": "); json_escape_gstring(body, LN_STATION_VERSION); g_string_append(body, ",\n");
+    g_string_append(body, "  \"station_id\": "); json_escape_gstring(body, ctx->station_id); g_string_append(body, ",\n");
+    g_string_append(body, "  \"operator_id\": "); json_escape_gstring(body, ctx->operator_id); g_string_append(body, ",\n");
+    g_string_append(body, "  \"identity_id\": "); json_escape_gstring(body, ctx->identity_id); g_string_append(body, ",\n");
+    g_string_append(body, "  \"work_order\": "); json_escape_gstring(body, ctx->work_order); g_string_append(body, ",\n");
+    if (ctx->session[0]) {
+        g_string_append(body, "  \"session\": "); json_escape_gstring(body, ctx->session); g_string_append(body, ",\n");
+    }
+    g_string_append(body, "  \"qa_standard\": "); json_escape_gstring(body, ln_station_current_qa_standard()); g_string_append(body, ",\n");
+    g_string_append_printf(body, "  \"qa_rate_limit_s_per_day\": %d,\n", ln_station_current_qa_rate_limit());
+    g_string_append(body, "  \"temperature_condition\": "); json_escape_gstring(body, ln_station_current_temperature_condition()); g_string_append(body, ",\n");
+    g_string_append(body, "  \"measurement_type\": "); json_escape_gstring(body, ln_station_current_measurement_type()); g_string_append(body, ",\n");
+    g_string_append_printf(body, "  \"followup_mode\": %s,\n", ln_station_is_followup() ? "true" : "false");
+    g_string_append(body, "  \"timestamp_iso\": "); json_escape_gstring(body, stamp_iso); g_string_append(body, ",\n");
+    g_string_append_printf(body, "  \"lift_angle_deg\": %.6f,\n", lift_angle_deg);
+    g_string_append_printf(body, "  \"sample_rate_hz\": %.6f,\n", sample_rate_hz);
+    g_string_append(body, "  \"positions\": [\n");
+    for (j = 0; j < count; j++) {
+        g_string_append(body, "    {\n");
+        g_string_append(body, "      \"position\": "); json_escape_gstring(body, positions[j]); g_string_append(body, ",\n");
+        g_string_append_printf(body, "      \"rate_s_per_day\": %.6f,\n", results[j].rate_s_per_day);
+        g_string_append_printf(body, "      \"beat_error_ms\": %.6f,\n", results[j].beat_error_ms);
+        g_string_append_printf(body, "      \"amplitude_deg\": %.6f,\n", results[j].amplitude_deg);
+        g_string_append_printf(body, "      \"beat_frequency_bph\": %.6f,\n", results[j].bph);
+        g_string_append_printf(body, "      \"sample_count\": %d,\n", results[j].sample_count);
+        g_string_append_printf(body, "      \"duration_seconds\": %.6f\n", results[j].elapsed_seconds);
+        g_string_append(body, j + 1 < count ? "    },\n" : "    }\n");
+    }
+    g_string_append(body, "  ]\n");
+    g_string_append(body, "}\n");
+
     fputs(body->str, f);
     g_string_free(body, TRUE);
     fclose(f);
@@ -943,4 +1094,20 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
             status, total_seconds * 1000.0, connect_seconds * 1000.0);
     fflush(stderr);
     return 0;
+}
+
+int ln_station_complete_session(const LnStationContext *ctx, const char *session, char *response, unsigned long response_len) {
+    char body[160];
+
+    if (!ctx || !session || !session[0]) {
+        safe_copy(response, response_len, "No session was established -- every submission in this session must have failed");
+        return -1;
+    }
+    if (!ctx->submit_enabled) {
+        safe_copy(response, response_len, "submit disabled; nothing to complete on the ERP side");
+        return 1;
+    }
+
+    g_snprintf(body, sizeof(body), "{\"session\":\"%s\"}", session);
+    return ln_station_http_post_json(ctx, "ln_watch_inventory.freeerp.complete_measurement_session", body, response, response_len);
 }

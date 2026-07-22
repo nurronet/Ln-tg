@@ -1,16 +1,12 @@
 #include "ln_station_panel.h"
 #include "ln_erp_config.h"
 
-#define LN_POSITION_COUNT 6
-
-static const char *LN_POSITIONS[LN_POSITION_COUNT] = {
-    "Dial Up",
-    "Dial Down",
-    "Crown Up",
-    "Crown Down",
-    "Crown Left",
-    "Crown Right"
-};
+/* Position names/count now live in ln_station.h (ln_station_position_names)
+ * as the single source of truth shared with the full-session export/submit
+ * path -- kept as a local alias here so the rest of this file's many
+ * LN_POSITION_COUNT references don't need to change. */
+#define LN_POSITION_COUNT LN_STATION_POSITION_COUNT
+#define LN_POSITIONS ln_station_position_names
 
 typedef struct {
     LnStationContext *ctx;
@@ -640,6 +636,12 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Follow-up Certification");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Service Check");
     gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Regulation Check");
+    /* Bare-movement pre-casing screening pass -- sorts a movement's
+     * functional_grade (suggested, not auto-applied) rather than
+     * producing a finished-watch certificate. Appended rather than
+     * inserted first so the existing default selection doesn't change
+     * for operators used to today's list. */
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(panel->measurement_type_combo), "Qualification");
     gtk_combo_box_set_active(GTK_COMBO_BOX(panel->measurement_type_combo), 0);
 
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Search / Scan", panel->identity_entry), FALSE, FALSE, 0);
