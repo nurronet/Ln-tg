@@ -2,6 +2,7 @@
 #define LN_STATION_H
 
 #include <stdbool.h>
+#include <time.h>
 
 #ifndef LN_STATION_VERSION
 #define LN_STATION_VERSION "0.9.0"
@@ -22,6 +23,15 @@ typedef struct {
      * a watch's position readings under one LN Measurement Session instead
      * of minting a new session per reading. Cleared between sessions. */
     char session[96];
+    /* Operator PIN sign-in (see ln_operator.h). The token lives here, in
+     * memory only: it is never written to the config, a log or an export.
+     * Empty = nobody is signed in. operator_signed_at/last_used are the
+     * station's own clock readings, used to stop sending a token the ERP
+     * has probably let lapse. */
+    char operator_session[96];
+    char operator_name[96];
+    time_t operator_signed_at;
+    time_t operator_last_used;
     char position[32];
     char qa_standard[32];
     char temperature_condition[32];
@@ -134,6 +144,29 @@ typedef struct {
 void ln_station_init(LnStationContext *ctx);
 void ln_station_set_identity(LnStationContext *ctx, const char *identity_id);
 void ln_station_set_operator(LnStationContext *ctx, const char *operator_id);
+
+/* Operator PIN sign-in. Return values of ln_station_operator_sign_in:
+ *   0  signed in (ctx->operator_id is set to the ERP's spelling of the ID)
+ *   1  the ERP refused (wrong PIN, locked, station not registered ...);
+ *      `message` holds its wording, to be shown as is
+ *  -1  could not reach the ERP, or its answer was not understood
+ *  -2  the PIN is not 6 to 8 digits (not sent, so no try is used up)
+ * The PIN is wiped from every buffer this code owns before it returns;
+ * the caller should wipe its own copy (ln_operator_wipe). */
+int ln_station_operator_sign_in(LnStationContext *ctx, const char *operator_id, const char *pin,
+                                char *message, unsigned long message_len);
+/* Forgets the token and asks the ERP to end the sign-in (best effort: the
+ * token is forgotten either way). */
+void ln_station_operator_sign_out(LnStationContext *ctx);
+int ln_station_operator_signed_in(const LnStationContext *ctx);
+/* Signed in AND by the station's clock not yet near the ERP's limits. */
+int ln_station_operator_session_usable(const LnStationContext *ctx);
+/* Drops the token without telling the ERP (it has already ended it). */
+void ln_station_operator_forget(LnStationContext *ctx);
+/* Call with each submit_timing_result outcome. If the ERP says the sign-in
+ * was not accepted, the token is dropped and 1 is returned; otherwise
+ * (rc == 0) the sign-in counts as used just now and 0 is returned. */
+int ln_station_operator_note_submit(LnStationContext *ctx, int submit_rc, const char *response);
 void ln_station_set_position(LnStationContext *ctx, const char *position);
 const char *ln_station_current_position(void);
 void ln_station_set_qa_standard(const char *standard);

@@ -1,5 +1,6 @@
 #include "ln_station_panel.h"
 #include "ln_erp_config.h"
+#include "ln_operator.h"
 #include "ln_scanner.h"
 #include <windows.h>
 #include <shellapi.h>
@@ -26,6 +27,7 @@ typedef struct {
     int suppress_identity_change;
     GtkWidget *work_order_entry;
     GtkWidget *operator_entry;
+    GtkWidget *operator_button; /* "Sign in" / "Sign out", next to the operator entry */
     GtkWidget *position_combo;
     GtkWidget *qa_standard_combo;
     GtkWidget *temperature_combo;
@@ -602,6 +604,113 @@ static void on_operator_changed(GtkEditable *editable, gpointer user_data) {
     ln_station_set_operator(panel->ctx, text);
 }
 
+/* Brings the Operator row in line with the sign-in state. While someone is
+ * signed in the entry is read-only: a result names an operator and the ERP
+ * only attests it if that is the one who signed in, so the field must not
+ * be changeable underneath the token. */
+static void refresh_operator_widgets(LnStationPanel *panel) {
+    int signed_in = ln_station_operator_signed_in(panel->ctx);
+    gtk_button_set_label(GTK_BUTTON(panel->operator_button), signed_in ? "Sign out" : "Sign in");
+    gtk_editable_set_editable(GTK_EDITABLE(panel->operator_entry), !signed_in);
+    if (signed_in) {
+        gtk_entry_set_text(GTK_ENTRY(panel->operator_entry), panel->ctx->operator_id);
+        gtk_widget_set_tooltip_text(panel->operator_entry,
+                                    panel->ctx->operator_name[0] ? panel->ctx->operator_name : "Signed in");
+        gtk_widget_set_tooltip_text(panel->operator_button, "Sign out");
+    } else {
+        gtk_widget_set_tooltip_text(panel->operator_entry, NULL);
+        gtk_widget_set_tooltip_text(panel->operator_button,
+                                    "Sign in with your Operator ID and PIN so the ERP can attest your results");
+    }
+}
+
+/* Asks for the Operator ID and PIN and signs in. The dialog stays open
+ * after a refusal (wrong PIN, locked ...) with the ERP's own words shown,
+ * so the operator can try again or cancel. Returns 1 if signed in. The PIN
+ * is wiped from our copy as soon as the call returns. */
+static int run_operator_sign_in_dialog(LnStationPanel *panel) {
+    GtkWidget *parent = gtk_widget_get_toplevel(panel->root);
+    GtkWidget *dialog = gtk_dialog_new_with_buttons("Operator sign-in", GTK_IS_WINDOW(parent) ? GTK_WINDOW(parent) : NULL,
+                                                     GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+                                                     "Cancel", GTK_RESPONSE_CANCEL, "Sign in", GTK_RESPONSE_OK, NULL);
+    GtkWidget *area = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new();
+    GtkWidget *id_label = gtk_label_new("Operator ID");
+    GtkWidget *pin_label = gtk_label_new("PIN");
+    GtkWidget *id_entry = gtk_entry_new();
+    GtkWidget *pin_entry = gtk_entry_new();
+    GtkWidget *message_label = gtk_label_new("");
+    int signed_in = 0;
+
+    gtk_widget_set_halign(id_label, GTK_ALIGN_START);
+    gtk_widget_set_halign(pin_label, GTK_ALIGN_START);
+    gtk_entry_set_text(GTK_ENTRY(id_entry), panel->ctx->operator_id);
+    gtk_entry_set_visibility(GTK_ENTRY(pin_entry), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(pin_entry), GTK_INPUT_PURPOSE_PIN);
+    gtk_entry_set_max_length(GTK_ENTRY(pin_entry), 8);
+    gtk_entry_set_placeholder_text(GTK_ENTRY(pin_entry), "6 to 8 digits");
+    gtk_entry_set_activates_default(GTK_ENTRY(id_entry), TRUE);
+    gtk_entry_set_activates_default(GTK_ENTRY(pin_entry), TRUE);
+    gtk_label_set_line_wrap(GTK_LABEL(message_label), TRUE);
+    gtk_label_set_max_width_chars(GTK_LABEL(message_label), 40);
+    gtk_widget_set_halign(message_label, GTK_ALIGN_START);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+    gtk_grid_attach(GTK_GRID(grid), id_label, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), id_entry, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), pin_label, 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), pin_entry, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), message_label, 0, 2, 2, 1);
+    gtk_container_add(GTK_CONTAINER(area), grid);
+    gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_OK);
+    gtk_widget_show_all(dialog);
+    gtk_widget_grab_focus(panel->ctx->operator_id[0] ? pin_entry : id_entry);
+
+    while (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_OK) {
+        char message[256];
+        char *pin = g_strdup(gtk_entry_get_text(GTK_ENTRY(pin_entry)));
+        int rc;
+
+        gtk_entry_set_text(GTK_ENTRY(pin_entry), "");
+        gtk_label_set_text(GTK_LABEL(message_label), "Signing in...");
+        gtk_widget_set_sensitive(dialog, FALSE);
+        while (gtk_events_pending()) gtk_main_iteration(); /* show the wait; the call below blocks */
+
+        rc = ln_station_operator_sign_in(panel->ctx, gtk_entry_get_text(GTK_ENTRY(id_entry)), pin, message, sizeof(message));
+        ln_operator_wipe(pin, strlen(pin));
+        g_free(pin);
+
+        gtk_widget_set_sensitive(dialog, TRUE);
+        if (rc == 0) {
+            signed_in = 1;
+            break;
+        }
+        gtk_label_set_text(GTK_LABEL(message_label), message);
+        gtk_widget_grab_focus(pin_entry);
+    }
+    gtk_widget_destroy(dialog);
+    return signed_in;
+}
+
+static void on_operator_button_clicked(GtkButton *button, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    (void)button;
+    if (ln_station_operator_signed_in(panel->ctx)) {
+        ln_station_operator_sign_out(panel->ctx);
+        refresh_operator_widgets(panel);
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "Operator signed out.");
+        return;
+    }
+    if (run_operator_sign_in_dialog(panel)) {
+        char status[256];
+        refresh_operator_widgets(panel);
+        g_snprintf(status, sizeof(status), "Signed in as %s.",
+                   panel->ctx->operator_name[0] ? panel->ctx->operator_name : panel->ctx->operator_id);
+        gtk_label_set_text(GTK_LABEL(panel->status_label), status);
+    }
+}
+
 static void on_position_changed(GtkComboBoxText *combo, gpointer user_data) {
     LnStationPanel *panel = (LnStationPanel *)user_data;
     gchar *text = gtk_combo_box_text_get_active_text(combo);
@@ -781,6 +890,8 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_entry_set_completion(GTK_ENTRY(panel->identity_entry), panel->identity_completion);
     panel->work_order_entry = gtk_entry_new();
     panel->operator_entry = gtk_entry_new();
+    panel->operator_button = gtk_button_new_with_label("Sign in");
+    gtk_widget_set_tooltip_text(panel->operator_button, "Sign in with your Operator ID and PIN so the ERP can attest your results");
     panel->position_combo = gtk_combo_box_text_new();
     panel->qa_standard_combo = gtk_combo_box_text_new();
     panel->temperature_combo = gtk_combo_box_text_new();
@@ -844,7 +955,12 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Watch Unit", panel->watch_unit_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("ERP Status", panel->identity_status_entry), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Work Order", panel->work_order_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Operator", panel->operator_entry), FALSE, FALSE, 0);
+    {
+        GtkWidget *operator_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+        gtk_box_pack_start(GTK_BOX(operator_box), panel->operator_entry, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(operator_box), panel->operator_button, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Operator", operator_box), FALSE, FALSE, 0);
+    }
     gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Position", panel->position_combo), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("QA Standard", panel->qa_standard_combo), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Temperature", panel->temperature_combo), FALSE, FALSE, 0);
@@ -998,6 +1114,7 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     g_signal_connect(panel->identity_completion, "match-selected", G_CALLBACK(on_identity_match_selected), panel);
     g_signal_connect(panel->work_order_entry, "changed", G_CALLBACK(on_work_order_changed), panel);
     g_signal_connect(panel->operator_entry, "changed", G_CALLBACK(on_operator_changed), panel);
+    g_signal_connect(panel->operator_button, "clicked", G_CALLBACK(on_operator_button_clicked), panel);
     g_signal_connect(panel->position_combo, "changed", G_CALLBACK(on_position_changed), panel);
     g_signal_connect(panel->qa_standard_combo, "changed", G_CALLBACK(on_qa_standard_changed), panel);
     g_signal_connect(panel->temperature_combo, "changed", G_CALLBACK(on_temperature_changed), panel);
@@ -1192,6 +1309,24 @@ static void reset_session_state(LnStationPanel *panel, int clear_identity_entry)
     refresh_position_rows(panel);
     if (panel->root)
         ln_station_panel_refresh_measurement(panel->root);
+}
+
+void ln_station_panel_refresh_operator(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    if (panel) refresh_operator_widgets(panel);
+}
+
+int ln_station_panel_prompt_operator_sign_in(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    int signed_in;
+    if (!panel) return 0;
+    if (ln_station_operator_signed_in(panel->ctx)) {
+        refresh_operator_widgets(panel);
+        return 1;
+    }
+    signed_in = run_operator_sign_in_dialog(panel);
+    refresh_operator_widgets(panel);
+    return signed_in;
 }
 
 void ln_station_panel_reset_session(GtkWidget *widget) {

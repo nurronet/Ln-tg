@@ -40,6 +40,14 @@ void ln_station_panel_trigger_capture(GtkWidget *panel);
  * don't start out mixed with the previous one's. */
 void ln_station_panel_reset_session(GtkWidget *panel);
 
+/* Operator PIN sign-in (see ln_operator.h). Refresh re-reads the sign-in
+ * state from the context -- call it after something outside the panel
+ * changed it (e.g. the ERP ended the sign-in). Prompt shows the sign-in
+ * dialog unless someone is already signed in; returns 1 if an operator is
+ * signed in afterwards, 0 if the dialog was cancelled. */
+void ln_station_panel_refresh_operator(GtkWidget *panel);
+int ln_station_panel_prompt_operator_sign_in(GtkWidget *panel);
+
 #ifdef __cplusplus
 }
 #endif
