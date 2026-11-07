@@ -872,6 +872,20 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 		return;
 	}
 
+	/* Operator PIN sign-in (see ln_operator.h): the ERP ends a sign-in after
+	 * 8 hours or 30 minutes without a result. Results sent after that
+	 * arrive Invalid, and from the next step on the per-position results
+	 * are cleared, so this is the last point where the operator can still
+	 * sign in again and have it all attested. Nobody signed in at all is
+	 * left as before (submitted, but not attested). */
+	if (ln_station_operator_signed_in(&ln_ctx) && !ln_station_operator_session_usable(&ln_ctx)) {
+		ln_station_operator_forget(&ln_ctx);
+		if (ln_panel_widget)
+			ln_station_panel_refresh_operator(ln_panel_widget);
+		error("The operator sign-in has timed out. Sign in again with your PIN, then press Complete Session again.");
+		return;
+	}
+
 	/* Always keep a local copy first: submission over the network can fail
 	 * or be disabled, but the measurement itself should never be lost.
 	 * One combined file for the whole session, not one per position. */
@@ -921,6 +935,10 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 	ln_ctx.session[0] = '\0';
 
 	int submitted_count = 0, failed_count = 0, disabled = 0;
+	int attested_count = 0, signin_rejected_count = 0;
+	char operator_name[96];
+	g_strlcpy(operator_name, ln_ctx.operator_name[0] ? ln_ctx.operator_name : ln_ctx.operator_id, sizeof(operator_name));
+	int had_signin = ln_station_operator_session_usable(&ln_ctx);
 	char last_response[4096] = "";
 	char failures[4096] = "";
 	for (i = 0; i < present_count; i++) {
@@ -932,6 +950,16 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 		int submit_rc = ln_station_submit_result(&ln_ctx, &result,
 			raw_samples_present[i], raw_sample_counts_present[i], response, sizeof(response));
 		g_strlcpy(last_response, response, sizeof(last_response));
+
+		int had_operator = ln_station_operator_session_usable(&ln_ctx);
+		if (ln_station_operator_note_submit(&ln_ctx, submit_rc, response))
+			signin_rejected_count++;
+		else if (submit_rc == 0 && had_operator) {
+			char status[32] = "";
+			ln_station_extract_json_string_field(response, "verification_status", status, sizeof(status));
+			if (strcmp(status, "Attested") == 0 || strcmp(status, "Verified") == 0)
+				attested_count++;
+		}
 
 		if (submit_rc == 0) {
 			submitted_count++;
@@ -997,6 +1025,30 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 			"Timing session marked complete, but %d/%d position%s failed to submit to ERP.\nLocal copy saved: %s\n%s",
 			failed_count, present_count, present_count == 1 ? "" : "s", session_out_path, failures);
 	}
+
+	/* Say what happened to the operator's sign-in. Skipped when nothing
+	 * reached the ERP (submission disabled, or every submit failed). */
+	if (submitted_count > 0) {
+		char operator_note[512] = "";
+		if (signin_rejected_count > 0) {
+			message_type = GTK_MESSAGE_WARNING;
+			g_snprintf(operator_note, sizeof(operator_note),
+				"\n\nThe ERP did not accept the operator sign-in for %d result%s, so %s recorded as Invalid. "
+				"Sign in again with your PIN before the next session.",
+				signin_rejected_count, signin_rejected_count == 1 ? "" : "s",
+				signin_rejected_count == 1 ? "it was" : "they were");
+		} else if (had_signin) {
+			g_snprintf(operator_note, sizeof(operator_note), "\n\nOperator %s: %d of %d result%s attested by the ERP.",
+				operator_name, attested_count, submitted_count, submitted_count == 1 ? "" : "s");
+		} else {
+			g_snprintf(operator_note, sizeof(operator_note),
+				"\n\nNo operator was signed in, so these results are not attested by the ERP. "
+				"Use Sign in next to Operator before the next session.");
+		}
+		g_strlcat(message, operator_note, sizeof(message));
+	}
+	if (signin_rejected_count > 0 && ln_panel_widget)
+		ln_station_panel_refresh_operator(ln_panel_widget);
 
 	GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(w->window), 0, message_type, GTK_BUTTONS_CLOSE, "%s", message);
 	gtk_dialog_run(GTK_DIALOG(dialog));

@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "ln_canonical.h"
+#include "ln_operator.h"
 #include "ln_signing.h"
 
 static char ln_station_global_position[32] = "Dial Up";
@@ -132,6 +133,12 @@ static void json_escape_gstring(GString *out, const char *s) {
  * ln_canonical_timing_result_json) -- the signature authenticates the
  * summary measurement, not the raw series behind it.
  *
+ * `operator_session` is the operator's sign-in token (see ln_operator.h):
+ * pass it only for the HTTP submission and NULL for a file export, so the
+ * token is never written to disk. Like raw_samples it sits outside the
+ * signed canonical form; the ERP reads it and removes it before it checks
+ * the signature.
+ *
  * `signatures`/`signature_count` are optional (pass NULL/0 for an unsigned
  * export or submission -- the field is omitted entirely rather than sent
  * as an empty array, matching the server's own "no signatures key present"
@@ -140,6 +147,7 @@ static void json_escape_gstring(GString *out, const char *s) {
  * ln_canonical_timing_result_json() for that. */
 static GString *build_timing_result_json(const LnStationContext *ctx, const LnTimingResult *result,
                                           const LnRawSample *raw_samples, int raw_sample_count,
+                                          const char *operator_session,
                                           const LnMeasurementSignature *signatures, int signature_count) {
     GString *out = g_string_sized_new(1024);
 
@@ -152,6 +160,9 @@ static GString *build_timing_result_json(const LnStationContext *ctx, const LnTi
     g_string_append(out, "  \"work_order\": "); json_escape_gstring(out, ctx->work_order); g_string_append(out, ",\n");
     if (ctx->session[0]) {
         g_string_append(out, "  \"session\": "); json_escape_gstring(out, ctx->session); g_string_append(out, ",\n");
+    }
+    if (operator_session && operator_session[0]) {
+        g_string_append(out, "  \"operator_session\": "); json_escape_gstring(out, operator_session); g_string_append(out, ",\n");
     }
     g_string_append(out, "  \"position\": "); json_escape_gstring(out, ctx->position); g_string_append(out, ",\n");
     g_string_append(out, "  \"qa_standard\": "); json_escape_gstring(out, ln_station_current_qa_standard()); g_string_append(out, ",\n");
@@ -744,7 +755,7 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
         return -2;
     }
 
-    body = build_timing_result_json(ctx, result, raw_samples, raw_sample_count, NULL, 0);
+    body = build_timing_result_json(ctx, result, raw_samples, raw_sample_count, NULL, NULL, 0);
     fputs(body->str, f);
     g_string_free(body, TRUE);
     fclose(f);
@@ -1104,14 +1115,14 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
         return -1;
     }
 
-    /* Sign with the workstation's own key (operator signing is a separate,
-     * later piece -- this submission will carry only one of the two
-     * signatures custody.py's verification wants, so the server-side
-     * verification_status will show "Invalid" rather than "Verified"
-     * until operator credentials exist. That's an accurate, expected
-     * interim state, not a bug: see docs/architecture-debt-map.md's
-     * custody ledger notes. A signing failure here is not fatal to the
-     * submission -- it just falls back to submitting unsigned. */
+    /* Sign with the workstation's own key. This submission carries only one
+     * of the two signatures custody.py's verification wants (the station
+     * has no key for the operator), so on its own the ERP records it as
+     * "Invalid". If an operator has signed in with their PIN (see
+     * ln_operator.h) the token goes along in the body, outside the signed
+     * canonical form, and the ERP records the result as "Attested"
+     * instead. A signing failure here is not fatal to the submission --
+     * it just falls back to submitting unsigned. */
     memset(&signature, 0, sizeof(signature));
     {
         char sign_error[256] = "";
@@ -1141,6 +1152,7 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
     }
 
     body = build_timing_result_json(ctx, result, raw_samples, raw_sample_count,
+                                     ln_station_operator_session_usable(ctx) ? ctx->operator_session : NULL,
                                      signature_count > 0 ? &signature : NULL, signature_count);
 
     g_snprintf(url, sizeof(url), "%s/api/method/ln_watch_inventory.freeerp.submit_timing_result", ctx->erp_base_url);
@@ -1223,4 +1235,131 @@ int ln_station_complete_session(const LnStationContext *ctx, const char *session
 
     g_snprintf(body, sizeof(body), "{\"session\":\"%s\"}", session);
     return ln_station_http_post_json(ctx, "ln_watch_inventory.freeerp.complete_measurement_session", body, response, response_len);
+}
+
+/* ---- Operator PIN sign-in (protocol: see ln_operator.h) ---- */
+
+int ln_station_operator_signed_in(const LnStationContext *ctx) {
+    return ctx && ctx->operator_session[0] != '\0';
+}
+
+int ln_station_operator_session_usable(const LnStationContext *ctx) {
+    return ln_station_operator_signed_in(ctx) &&
+           ln_operator_session_fresh(ctx->operator_signed_at, ctx->operator_last_used, time(NULL));
+}
+
+void ln_station_operator_forget(LnStationContext *ctx) {
+    if (!ctx) return;
+    ln_operator_wipe(ctx->operator_session, sizeof(ctx->operator_session));
+    ctx->operator_name[0] = '\0';
+    ctx->operator_signed_at = 0;
+    ctx->operator_last_used = 0;
+}
+
+int ln_station_operator_note_submit(LnStationContext *ctx, int submit_rc, const char *response) {
+    if (!ln_station_operator_signed_in(ctx)) return 0;
+    if (submit_rc == 0 && ln_operator_response_rejected_signin(response)) {
+        ln_station_log(ctx, "[LNWS OPERATOR] The ERP did not accept the operator sign-in; it must be done again\n");
+        ln_station_operator_forget(ctx);
+        return 1;
+    }
+    if (submit_rc == 0) ctx->operator_last_used = time(NULL);
+    return 0;
+}
+
+int ln_station_operator_sign_in(LnStationContext *ctx, const char *operator_id, const char *pin,
+                                char *message, unsigned long message_len) {
+    char id[64];
+    char response[4096];
+    GString *body;
+    LnOperatorLogin login;
+    const char *start;
+    size_t len;
+    int rc;
+
+    if (message && message_len) message[0] = '\0';
+    if (!ctx) return -1;
+
+    /* the ID as typed, without stray spaces (badge scanners and keyboards add them) */
+    start = operator_id ? operator_id : "";
+    while (*start == ' ' || *start == '\t') start++;
+    len = strlen(start);
+    while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t' || start[len - 1] == '\r' || start[len - 1] == '\n')) len--;
+    if (len == 0) {
+        safe_copy(message, message_len, "Enter the Operator ID.");
+        return -2;
+    }
+    if (len >= sizeof(id)) len = sizeof(id) - 1;
+    memcpy(id, start, len);
+    id[len] = '\0';
+
+    if (!ln_operator_pin_format_ok(pin)) {
+        safe_copy(message, message_len, "The PIN is 6 to 8 digits.");
+        return -2;
+    }
+    if (!ctx->erp_base_url[0] || !ctx->api_key[0] || !ctx->api_secret[0]) {
+        safe_copy(message, message_len, "The ERP connection is not set up (base URL, API key and secret). Use ERP Connection first.");
+        return -1;
+    }
+
+    /* sized so the PIN is never copied by a reallocation: the whole body fits from the start */
+    body = g_string_sized_new(512);
+    g_string_append(body, "{\"operator_id\": "); json_escape_gstring(body, id);
+    g_string_append(body, ", \"pin\": "); json_escape_gstring(body, pin);
+    g_string_append(body, ", \"station_id\": "); json_escape_gstring(body, ctx->station_id);
+    g_string_append(body, "}");
+
+    rc = ln_station_http_post_json(ctx, "ln_watch_inventory.freeerp.operator_login", body->str, response, sizeof(response));
+    ln_operator_wipe(body->str, body->allocated_len);
+    g_string_free(body, TRUE);
+
+    if (rc != 0) {
+        /* A network failure puts curl's own text in `response`; an HTTP error would put the ERP's page there,
+         * which tells the operator nothing, so say what happened in words. */
+        if (rc < 0) g_snprintf(message, message_len, "Could not reach the ERP: %s", response[0] ? response : "no answer");
+        else if (rc == 401 || rc == 403)
+            safe_copy(message, message_len, "The ERP did not accept this station's API key. An administrator needs to check it.");
+        else g_snprintf(message, message_len, "The ERP answered with an error (HTTP %d). Try again, or ask an administrator.", rc);
+        ln_operator_wipe(response, sizeof(response));
+        return -1;
+    }
+
+    if (ln_operator_parse_login(response, &login) != 0) {
+        safe_copy(message, message_len, "The ERP's answer was not understood. Check that the ERP is up to date.");
+        ln_operator_wipe(response, sizeof(response));
+        return -1;
+    }
+    ln_operator_wipe(response, sizeof(response));
+
+    if (!login.ok) {
+        safe_copy(message, message_len, login.reason);
+        ln_operator_wipe(&login, sizeof(login));
+        return 1;
+    }
+
+    safe_copy(ctx->operator_session, sizeof(ctx->operator_session), login.session);
+    safe_copy(ctx->operator_name, sizeof(ctx->operator_name), login.operator_name);
+    safe_copy(ctx->operator_id, sizeof(ctx->operator_id), login.operator_id[0] ? login.operator_id : id);
+    ctx->operator_signed_at = time(NULL);
+    ctx->operator_last_used = ctx->operator_signed_at;
+    ln_operator_wipe(&login, sizeof(login));
+    ln_station_log(ctx, "[LNWS OPERATOR] %s signed in\n", ctx->operator_id);
+    return 0;
+}
+
+void ln_station_operator_sign_out(LnStationContext *ctx) {
+    char response[1024];
+    GString *body;
+
+    if (!ln_station_operator_signed_in(ctx)) return;
+    if (ctx->erp_base_url[0] && ctx->api_key[0] && ctx->api_secret[0]) {
+        body = g_string_sized_new(256);
+        g_string_append(body, "{\"session\": "); json_escape_gstring(body, ctx->operator_session); g_string_append(body, "}");
+        /* best effort: if the ERP cannot be reached the token is dropped here anyway, and lapses there by itself */
+        ln_station_http_post_json(ctx, "ln_watch_inventory.freeerp.operator_logout", body->str, response, sizeof(response));
+        ln_operator_wipe(body->str, body->allocated_len);
+        g_string_free(body, TRUE);
+    }
+    ln_station_log(ctx, "[LNWS OPERATOR] %s signed out\n", ctx->operator_id);
+    ln_station_operator_forget(ctx);
 }
