@@ -11,6 +11,10 @@ extern "C" {
 GtkWidget *ln_station_panel_new(LnStationContext *ctx);
 void ln_station_panel_set_status(GtkWidget *panel, const char *status);
 void ln_station_panel_advance_position(GtkWidget *panel);
+
+/* Mirrors ln_station_panel_advance_position, one position earlier -- lets
+ * an operator undo an accidental double-click on Next Position. */
+void ln_station_panel_retreat_position(GtkWidget *panel);
 void ln_station_panel_bind_actions(GtkWidget *panel, GCallback save_callback, GCallback next_callback, GCallback complete_callback, gpointer user_data);
 void ln_station_panel_bind_sidebar_toggle(GtkWidget *panel, GCallback toggle_callback, gpointer user_data);
 

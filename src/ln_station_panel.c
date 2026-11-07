@@ -1,5 +1,8 @@
 #include "ln_station_panel.h"
 #include "ln_erp_config.h"
+#include "ln_scanner.h"
+#include <windows.h>
+#include <shellapi.h>
 
 /* Position names/count now live in ln_station.h (ln_station_position_names)
  * as the single source of truth shared with the full-session export/submit
@@ -12,6 +15,7 @@ typedef struct {
     LnStationContext *ctx;
     GtkWidget *root;
     GtkWidget *identity_entry;
+    GtkWidget *open_in_erp_button;
     GtkEntryCompletion *identity_completion;
     GtkListStore *identity_store;
     GtkWidget *movement_serial_entry;
@@ -27,16 +31,29 @@ typedef struct {
     GtkWidget *temperature_combo;
     GtkWidget *measurement_type_combo;
     GtkWidget *status_label;
+    /* Positions table (see refresh_position_rows): position_rows[i] is the
+     * position-name cell specifically, kept under this name so the existing
+     * active-row-highlight logic didn't need renaming -- position_num[i]
+     * and position_status[i] are the other two cells in that same row. All
+     * three get the active-row CSS class together (see
+     * set_position_row_active) since a GtkGrid has no single "row" widget
+     * of its own to attach a style class to. */
+    GtkWidget *position_num[LN_POSITION_COUNT];
     GtkWidget *position_rows[LN_POSITION_COUNT];
     GtkWidget *position_status[LN_POSITION_COUNT];
+    GtkWidget *identity_details_revealer;
+    GtkWidget *identity_details_toggle;
     GtkWidget *data_entry_revealer;
     GtkWidget *data_entry_toggle;
     GtkWidget *save_button;
+    GtkWidget *prev_button;
     GtkWidget *next_button;
     GtkWidget *complete_button;
     GtkWidget *erp_button;
+    GtkWidget *scanner_button;
     GtkWidget *bench_label;
     LnErpConfig erp_config;
+    LnScannerConfig scanner_config;
     GtkWidget *measurement_rate_label;
     GtkWidget *measurement_be_label;
     GtkWidget *measurement_amp_label;
@@ -55,6 +72,11 @@ typedef struct {
  * forward-declared so lookup_identity_now() can call it. */
 static void reset_session_state(LnStationPanel *panel, int clear_identity_entry);
 
+/* Defined further down; forward-declared so the scanner callbacks (which
+ * need to appear near on_erp_settings, well before lookup_identity_now's
+ * own definition) can call it. */
+static void lookup_identity_now(LnStationPanel *panel, const char *identity);
+
 static void ln_station_panel_install_css(void) {
     static int installed = 0;
     if (installed) return;
@@ -67,16 +89,17 @@ static void ln_station_panel_install_css(void) {
         ".lnws-brand { color: #ffffff; font-size: 22px; font-weight: 700; letter-spacing: 1px; }"
         ".lnws-subtitle { color: #c9d0d6; font-size: 10px; letter-spacing: 0.5px; }"
         ".lnws-bench { color: #7ee36b; font-size: 12px; font-weight: 700; }"
-        ".lnws-card { background: #17202a; border: 1px solid #2a3745; border-radius: 4px; padding: 10px; margin: 6px; }"
+        ".lnws-card { background: #17202a; border: 1px solid #2a3745; border-radius: 4px; padding: 6px; margin: 3px; }"
         ".lnws-section-title { color: #ffffff; font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }"
         ".lnws-muted { color: #aeb8c2; font-size: 10px; }"
         ".lnws-ok { color: #42dc55; font-weight: 700; }"
         ".lnws-value { color: #ffffff; font-weight: 700; }"
         ".lnws-green { color: #42dc55; font-weight: 700; }"
         ".lnws-position-active { background: #173b87; border-radius: 3px; }"
-        ".lnws-position-row { padding: 4px; }"
+        ".lnws-position-cell { padding: 2px 4px; }"
         ".lnws-action { font-size: 14px; font-weight: 700; padding: 12px; }"
-        ".lnws-icon-action { font-size: 16px; font-weight: 700; padding: 4px 8px; }";
+        ".lnws-icon-action { font-size: 16px; font-weight: 700; padding: 4px 8px; }"
+        ".lnws-toggle { font-size: 10px; padding: 2px 6px; }";
 
     gtk_css_provider_load_from_data(provider, css, -1, NULL);
     gtk_style_context_add_provider_for_screen(
@@ -122,15 +145,18 @@ static void refresh_position_rows(LnStationPanel *panel) {
     int completed_count = 0;
 
     for (int i = 0; i < LN_POSITION_COUNT; i++) {
-        GtkStyleContext *ctx = gtk_widget_get_style_context(panel->position_rows[i]);
         LnPositionResult result;
         int has_result = ln_station_get_position_result(LN_POSITIONS[i], &result);
         char status_text[64];
+        GtkWidget *row_widgets[3] = {panel->position_num[i], panel->position_rows[i], panel->position_status[i]};
 
-        if (i == active)
-            gtk_style_context_add_class(ctx, "lnws-position-active");
-        else
-            gtk_style_context_remove_class(ctx, "lnws-position-active");
+        for (int w = 0; w < 3; w++) {
+            GtkStyleContext *ctx = gtk_widget_get_style_context(row_widgets[w]);
+            if (i == active)
+                gtk_style_context_add_class(ctx, "lnws-position-active");
+            else
+                gtk_style_context_remove_class(ctx, "lnws-position-active");
+        }
 
         if (has_result) {
             completed_count++;
@@ -197,6 +223,77 @@ static void on_erp_settings(GtkButton *button, gpointer user_data) {
         update_erp_status(panel);
         gtk_label_set_text(GTK_LABEL(panel->status_label),
                            panel->erp_config.enabled ? "ERP connection saved and synchronization enabled." : "ERP connection saved; synchronization disabled.");
+    } else if (status[0]) {
+        gtk_label_set_text(GTK_LABEL(panel->status_label), status);
+    }
+}
+
+/* Delivered on the GTK main thread (see ln_scanner.h) whenever the COM
+ * scanner reads a complete value. Mirrors on_identity_activate exactly --
+ * sets the field so the operator sees what was scanned, then triggers the
+ * same lookup path a manual Enter-key confirm would, but without depending
+ * on the identity field actually having keyboard focus at scan time. */
+static void on_scanner_scan_received(const char *value, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    if (!panel || !value || !*value) return;
+    panel->suppress_identity_change = 1;
+    gtk_entry_set_text(GTK_ENTRY(panel->identity_entry), value);
+    panel->suppress_identity_change = 0;
+    lookup_identity_now(panel, value);
+}
+
+static void on_scanner_status(const char *message, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    if (!panel || !message) return;
+    gtk_label_set_text(GTK_LABEL(panel->status_label), message);
+}
+
+/* Opens the currently-loaded identity's own record in the ERP, in the
+ * system's default browser -- e.g. https://erp.example.com/desk/
+ * ln-inventory-identity/LN-ST2130-CV-00002. LN Inventory Identity autonames
+ * off identity_id directly (field:identity_id), so the docname to put in
+ * the URL is exactly whatever's in the Search/Scan field -- no separate
+ * lookup needed. No escaping applied to the identity_id: it's always
+ * either scanned/generated by this same system or typed in by an operator
+ * as a plain alphanumeric-and-hyphens code, never containing characters
+ * that would need URL-encoding. */
+static void on_open_in_erp(GtkButton *button, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    const char *identity_id;
+    char url[900];
+    (void)button;
+    if (!panel) return;
+
+    identity_id = gtk_entry_get_text(GTK_ENTRY(panel->identity_entry));
+    if (!identity_id || !*identity_id) {
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "Scan or select an identity first.");
+        return;
+    }
+    if (!panel->erp_config.base_url[0]) {
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "Set an ERP Base URL first (ERP Connection).");
+        return;
+    }
+
+    g_snprintf(url, sizeof(url), "%s/desk/ln-inventory-identity/%s", panel->erp_config.base_url, identity_id);
+    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void on_scanner_settings(GtkButton *button, gpointer user_data) {
+    (void)button;
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    GtkWidget *toplevel;
+    char status[512] = {0};
+    if (!panel) return;
+
+    toplevel = gtk_widget_get_toplevel(panel->root);
+    if (ln_scanner_dialog_run(GTK_IS_WINDOW(toplevel) ? GTK_WINDOW(toplevel) : NULL,
+                              &panel->scanner_config, status, sizeof(status))) {
+        ln_scanner_start(&panel->scanner_config, on_scanner_scan_received, on_scanner_status, panel);
+        if (!panel->scanner_config.enabled)
+            gtk_label_set_text(GTK_LABEL(panel->status_label), "Scanner settings saved; COM scanning disabled.");
+        /* If enabled, on_scanner_status will report "Connected to COMx..." or
+         * a failure shortly, from the background thread -- no need to set a
+         * status message here too. */
     } else if (status[0]) {
         gtk_label_set_text(GTK_LABEL(panel->status_label), status);
     }
@@ -577,10 +674,62 @@ static void on_next_position(GtkButton *button, gpointer user_data) {
     ln_station_panel_advance_position(GTK_WIDGET(user_data));
 }
 
+/* Mirrors ln_station_panel_advance_position, one position earlier -- lets
+ * an operator recover from an accidental double-click on Next Position
+ * (or just re-check/redo the previous reading) without having to cycle
+ * all the way around via the position combo. */
+void ln_station_panel_retreat_position(GtkWidget *widget) {
+    LnStationPanel *panel = g_object_get_data(G_OBJECT(widget), "ln-station-panel");
+    if (!panel) return;
+
+    int active = gtk_combo_box_get_active(GTK_COMBO_BOX(panel->position_combo));
+    if (active < 0) active = 0;
+
+    if (active == 0) {
+        /* First position -- nothing before it to go back to. Wrapping to
+         * the last position here would silently start overwriting whatever
+         * that position already recorded -- the same risk guarded against
+         * at the other end in ln_station_panel_advance_position. */
+        ln_station_capture_stop();
+        refresh_position_rows(panel);
+        ln_station_panel_refresh_measurement(widget);
+        gtk_label_set_text(GTK_LABEL(panel->status_label), "Already at the first position.");
+        return;
+    }
+
+    active = active - 1;
+    gtk_combo_box_set_active(GTK_COMBO_BOX(panel->position_combo), active);
+    refresh_position_rows(panel);
+    gtk_label_set_text(GTK_LABEL(panel->status_label), "Moved to previous timing position.");
+}
+
+static void on_prev_position(GtkButton *button, gpointer user_data) {
+    (void)button;
+    ln_station_panel_retreat_position(GTK_WIDGET(user_data));
+}
+
 static void on_toggle_data_entry(GtkButton *button, gpointer user_data) {
     (void)button;
     LnStationPanel *panel = (LnStationPanel *)user_data;
     gtk_label_set_text(GTK_LABEL(panel->status_label), "Data panel hidden. Use the side handle to show it again.");
+}
+
+/* Collapses everything in the IDENTITY card except the Search/Scan field
+ * itself -- once an identity's confirmed, an operator rarely needs to keep
+ * staring at its Movement S/N/Watch Unit/etc. every position, and freeing
+ * that vertical space is most of what makes the sidebar fit a 1080p
+ * screen. Search/Scan stays outside the revealer regardless, since that's
+ * the one field that must always be reachable (barcode scans land there). */
+static void on_toggle_identity_details(GtkButton *button, gpointer user_data) {
+    LnStationPanel *panel = (LnStationPanel *)user_data;
+    gboolean now_visible;
+    (void)button;
+    if (!panel || !panel->identity_details_revealer) return;
+
+    now_visible = !gtk_revealer_get_reveal_child(GTK_REVEALER(panel->identity_details_revealer));
+    gtk_revealer_set_reveal_child(GTK_REVEALER(panel->identity_details_revealer), now_visible);
+    gtk_button_set_label(GTK_BUTTON(panel->identity_details_toggle),
+                          now_visible ? "▾  Hide Details" : "▸  Show Details");
 }
 
 GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
@@ -637,6 +786,7 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     panel->temperature_combo = gtk_combo_box_text_new();
     panel->measurement_type_combo = gtk_combo_box_text_new();
     panel->erp_button = gtk_button_new_with_label("⚙  ERP Connection");
+    panel->scanner_button = gtk_button_new_with_label("⚙  Scanner Connection");
 
     gtk_entry_set_placeholder_text(GTK_ENTRY(panel->identity_entry), "LN-SER-00025 / watch serial");
     gtk_entry_set_placeholder_text(GTK_ENTRY(panel->work_order_entry), "LN-MFG-00042 / optional");
@@ -671,16 +821,37 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_combo_box_set_active(GTK_COMBO_BOX(panel->measurement_type_combo), 0);
 
     gtk_box_pack_start(GTK_BOX(identity_card), make_row("Search / Scan", panel->identity_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Movement S/N", panel->movement_serial_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Movement / Part", panel->movement_part_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Watch Unit", panel->watch_unit_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("ERP Status", panel->identity_status_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Work Order", panel->work_order_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Operator", panel->operator_entry), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Position", panel->position_combo), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("QA Standard", panel->qa_standard_combo), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Temperature", panel->temperature_combo), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(identity_card), make_row("Measurement", panel->measurement_type_combo), FALSE, FALSE, 0);
+
+    /* Kept outside the details revealer, on the same row as the toggle --
+     * this is a quick per-identity action an operator would want reachable
+     * regardless of whether the details section is collapsed. */
+    GtkWidget *identity_actions_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    panel->identity_details_toggle = gtk_button_new_with_label("▾  Hide Details");
+    add_class(panel->identity_details_toggle, "lnws-toggle");
+    panel->open_in_erp_button = gtk_button_new_with_label("🔗  Open in ERP");
+    add_class(panel->open_in_erp_button, "lnws-toggle");
+    gtk_box_pack_start(GTK_BOX(identity_actions_row), panel->identity_details_toggle, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_actions_row), panel->open_in_erp_button, FALSE, FALSE, 0);
+    gtk_widget_set_halign(identity_actions_row, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(identity_card), identity_actions_row, FALSE, FALSE, 0);
+
+    panel->identity_details_revealer = gtk_revealer_new();
+    gtk_revealer_set_transition_type(GTK_REVEALER(panel->identity_details_revealer), GTK_REVEALER_TRANSITION_TYPE_SLIDE_DOWN);
+    gtk_revealer_set_reveal_child(GTK_REVEALER(panel->identity_details_revealer), TRUE);
+    GtkWidget *identity_details_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Movement S/N", panel->movement_serial_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Movement / Part", panel->movement_part_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Watch Unit", panel->watch_unit_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("ERP Status", panel->identity_status_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Work Order", panel->work_order_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Operator", panel->operator_entry), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Position", panel->position_combo), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("QA Standard", panel->qa_standard_combo), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Temperature", panel->temperature_combo), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(identity_details_box), make_row("Measurement", panel->measurement_type_combo), FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(panel->identity_details_revealer), identity_details_box);
+    gtk_box_pack_start(GTK_BOX(identity_card), panel->identity_details_revealer, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(root), identity_card, FALSE, FALSE, 0);
 
     GtkWidget *session_card = make_card("▣  SESSION");
@@ -698,24 +869,59 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_box_pack_start(GTK_BOX(session_card), panel->positions_completed_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), session_card, FALSE, FALSE, 0);
 
+    /* A GtkGrid instead of one padded GtkBox per position -- GtkGrid aligns
+     * columns natively (widest cell in each column sets that column's
+     * width across every row) and has no per-row widget/padding overhead,
+     * so 6 positions take noticeably less vertical space than 6 separate
+     * boxed rows did, which is most of the point on a 1080p screen. */
     GtkWidget *positions_card = make_card("⚑  POSITIONS (6)");
+    GtkWidget *positions_grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(positions_grid), 1);
+    gtk_grid_set_column_spacing(GTK_GRID(positions_grid), 8);
+
+    GtkWidget *header_num = gtk_label_new("#");
+    GtkWidget *header_name = gtk_label_new("Position");
+    GtkWidget *header_status = gtk_label_new("Status");
+    add_class(header_num, "lnws-muted");
+    add_class(header_name, "lnws-muted");
+    add_class(header_status, "lnws-muted");
+    gtk_widget_set_halign(header_name, GTK_ALIGN_START);
+    gtk_widget_set_halign(header_status, GTK_ALIGN_END);
+    gtk_grid_attach(GTK_GRID(positions_grid), header_num, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(positions_grid), header_name, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(positions_grid), header_status, 2, 0, 1, 1);
+
     for (int i = 0; i < LN_POSITION_COUNT; i++) {
-        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
         GtkWidget *num = gtk_label_new(NULL);
         GtkWidget *name = gtk_label_new(LN_POSITIONS[i]);
         GtkWidget *status = gtk_label_new("○");
         char nbuf[8];
         snprintf(nbuf, sizeof(nbuf), "%d", i + 1);
         gtk_label_set_text(GTK_LABEL(num), nbuf);
-        add_class(row, "lnws-position-row");
-        gtk_widget_set_halign(name, GTK_ALIGN_START);
-        gtk_box_pack_start(GTK_BOX(row), num, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(row), name, TRUE, TRUE, 0);
-        gtk_box_pack_end(GTK_BOX(row), status, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(positions_card), row, FALSE, FALSE, 0);
-        panel->position_rows[i] = row;
+        add_class(num, "lnws-position-cell");
+        add_class(name, "lnws-position-cell");
+        add_class(status, "lnws-position-cell");
+        gtk_widget_set_halign(num, GTK_ALIGN_FILL);
+        gtk_label_set_xalign(GTK_LABEL(num), 0.5);
+        /* FILL (not START/END) so each label's own box actually spans its
+         * whole grid cell -- the active-row CSS background paints behind
+         * the label's allocated box, not just its glyphs, so START/END
+         * alignment left three disconnected highlighted patches sized to
+         * the text instead of one continuous row band. xalign keeps the
+         * text itself positioned the same as before within that wider box. */
+        gtk_widget_set_halign(name, GTK_ALIGN_FILL);
+        gtk_label_set_xalign(GTK_LABEL(name), 0.0);
+        gtk_widget_set_halign(status, GTK_ALIGN_FILL);
+        gtk_label_set_xalign(GTK_LABEL(status), 1.0);
+        gtk_widget_set_hexpand(name, TRUE);
+        gtk_grid_attach(GTK_GRID(positions_grid), num, 0, i + 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(positions_grid), name, 1, i + 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(positions_grid), status, 2, i + 1, 1, 1);
+        panel->position_num[i] = num;
+        panel->position_rows[i] = name;
         panel->position_status[i] = status;
     }
+    gtk_box_pack_start(GTK_BOX(positions_card), positions_grid, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), positions_card, FALSE, FALSE, 0);
 
     GtkWidget *stats_card = make_card("▤  ACROSS POSITIONS");
@@ -755,6 +961,7 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     add_class(data_help, "lnws-muted");
     gtk_container_add(GTK_CONTAINER(panel->data_entry_revealer), data_help);
     gtk_box_pack_start(GTK_BOX(data_card), panel->erp_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(data_card), panel->scanner_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(data_card), panel->data_entry_toggle, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(data_card), panel->data_entry_revealer, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), data_card, FALSE, FALSE, 0);
@@ -763,13 +970,22 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     gtk_box_pack_start(GTK_BOX(root), spacer, TRUE, TRUE, 0);
 
     panel->save_button = gtk_button_new_with_label("▣  Save Reading");
+    panel->prev_button = gtk_button_new_with_label("←  Previous");
     panel->next_button = gtk_button_new_with_label("→  Next Position");
     panel->complete_button = gtk_button_new_with_label("⚑  Complete Session");
     add_class(panel->save_button, "lnws-action");
+    /* Deliberately the smaller icon-action style, not lnws-action: this is
+     * a corrective/secondary action (undo an accidental double-click on
+     * Next Position), and giving it the same size and weight as Next would
+     * just recreate the mis-click risk one button over. */
+    add_class(panel->prev_button, "lnws-icon-action");
     add_class(panel->next_button, "lnws-action");
     add_class(panel->complete_button, "lnws-action");
     gtk_box_pack_start(GTK_BOX(root), panel->save_button, FALSE, FALSE, 6);
-    gtk_box_pack_start(GTK_BOX(root), panel->next_button, FALSE, FALSE, 6);
+    GtkWidget *position_nav_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_box_pack_start(GTK_BOX(position_nav_row), panel->prev_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(position_nav_row), panel->next_button, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(root), position_nav_row, FALSE, FALSE, 6);
     gtk_box_pack_start(GTK_BOX(root), panel->complete_button, FALSE, FALSE, 6);
 
     panel->status_label = gtk_label_new("Ready. Scan or enter an identity.");
@@ -786,9 +1002,11 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
     g_signal_connect(panel->qa_standard_combo, "changed", G_CALLBACK(on_qa_standard_changed), panel);
     g_signal_connect(panel->temperature_combo, "changed", G_CALLBACK(on_temperature_changed), panel);
     g_signal_connect(panel->measurement_type_combo, "changed", G_CALLBACK(on_measurement_type_changed), panel);
-    g_signal_connect(panel->next_button, "clicked", G_CALLBACK(on_next_position), root);
     g_signal_connect(panel->data_entry_toggle, "clicked", G_CALLBACK(on_toggle_data_entry), panel);
+    g_signal_connect(panel->identity_details_toggle, "clicked", G_CALLBACK(on_toggle_identity_details), panel);
+    g_signal_connect(panel->open_in_erp_button, "clicked", G_CALLBACK(on_open_in_erp), panel);
     g_signal_connect(panel->erp_button, "clicked", G_CALLBACK(on_erp_settings), panel);
+    g_signal_connect(panel->scanner_button, "clicked", G_CALLBACK(on_scanner_settings), panel);
 
     {
         char config_error[512] = {0};
@@ -801,9 +1019,51 @@ GtkWidget *ln_station_panel_new(LnStationContext *ctx) {
             gtk_label_set_text(GTK_LABEL(panel->status_label), "ERP configuration loaded. Ready to scan an identity.");
     }
 
-    g_object_set_data_full(G_OBJECT(root), "ln-station-panel", panel, g_free);
+    {
+        char scanner_config_error[512] = {0};
+        int scanner_config_result = ln_scanner_config_load(&panel->scanner_config, scanner_config_error, sizeof(scanner_config_error));
+        if (scanner_config_result < 0)
+            gtk_label_set_text(GTK_LABEL(panel->status_label), scanner_config_error);
+        else if (panel->scanner_config.enabled)
+            ln_scanner_start(&panel->scanner_config, on_scanner_scan_received, on_scanner_status, panel);
+    }
+
+    /* Wrapped in a scrolled window as a safety net on top of the tighter
+     * card spacing/collapsible identity details/grid positions table above
+     * -- even after all that, a 1080p screen at certain DPI/window-chrome
+     * combinations can still run short a few dozen pixels, and a vertical
+     * scrollbar guarantees every field stays reachable rather than
+     * silently clipping off the bottom of the window with no way back to
+     * it. Horizontal scrolling is disabled -- root's width is fixed above,
+     * nothing to scroll sideways for. */
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    /* root already has a fixed 390px width request, but that alone doesn't
+     * stop THIS widget (the one actually packed into the sidebar revealer)
+     * from claiming more horizontal room than that when the main window is
+     * resized wider -- a GtkScrolledWindow's own width isn't automatically
+     * pinned to its child's fixed width. Locking it here too, and refusing
+     * hexpand outright, is what actually keeps the sidebar's left/right
+     * edges fixed regardless of window width. Deliberately not touching
+     * height/valign here -- that's a separate, still-open problem. */
+    gtk_widget_set_size_request(scroll, 390, -1);
+    gtk_widget_set_hexpand(scroll, FALSE);
+    gtk_container_add(GTK_CONTAINER(scroll), root);
+
+    g_object_set_data_full(G_OBJECT(scroll), "ln-station-panel", panel, g_free);
+
+    /* Connected here, against `scroll`, rather than up above against
+     * `root` -- ln_station_panel_advance_position/retreat_position look up
+     * the "ln-station-panel" data via g_object_get_data() on whatever
+     * widget they're handed, and that data is only ever set on `scroll`
+     * (just above), never on `root`. Wiring these against `root` looked
+     * fine at a glance but left the lookup returning NULL and both
+     * buttons silently doing nothing on click. */
+    g_signal_connect(panel->prev_button, "clicked", G_CALLBACK(on_prev_position), scroll);
+    g_signal_connect(panel->next_button, "clicked", G_CALLBACK(on_next_position), scroll);
+
     refresh_position_rows(panel);
-    return root;
+    return scroll;
 }
 
 void ln_station_panel_set_status(GtkWidget *widget, const char *status) {

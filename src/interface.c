@@ -19,6 +19,7 @@
 #include "tg.h"
 #include "ln_station.h"
 #include "ln_station_panel.h"
+#include "ln_scanner.h"
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -201,6 +202,7 @@ static void on_shutdown(GApplication *app, void *p)
 	UNUSED(p);
 	debug("Main loop has terminated\n");
 	struct main_window *w = g_object_get_data(G_OBJECT(app), "main-window");
+	ln_scanner_stop();
 	if(w) {
 		save_config(w);
 		computer_destroy(w->computer);
@@ -764,8 +766,15 @@ static void save_ln_timing_json(GtkMenuItem *m, struct main_window *w) {
     if (!build_ln_timing_result_from_active_snapshot(w, &result))
         return;
 
+    /* Only present if this reading came from a completed capture window
+     * (see build_ln_timing_result_from_active_snapshot) -- returns 0 for
+     * the live-snapshot fallback case, which is exactly "no raw series
+     * to attach" rather than an error. */
+    LnRawSample raw_samples[LN_STATION_MAX_RAW_SAMPLES];
+    int raw_sample_count = ln_station_get_position_raw_samples(ln_station_current_position(), raw_samples, LN_STATION_MAX_RAW_SAMPLES);
+
     char out_path[1024];
-    int rc = ln_station_export_json(&ln_ctx, &result, out_path, sizeof(out_path));
+    int rc = ln_station_export_json(&ln_ctx, &result, raw_samples, raw_sample_count, out_path, sizeof(out_path));
     if (rc) {
         error("Unable to save LN timing JSON.\n%s", out_path);
         return;
@@ -839,12 +848,22 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 	 * still be saved/submitted from the stored results alone. */
 	const char *positions_present[LN_STATION_POSITION_COUNT];
 	LnPositionResult results_present[LN_STATION_POSITION_COUNT];
+	/* Captured here, before the session reset below wipes the underlying
+	 * per-position storage (ln_station_position_results_reset clears the
+	 * raw-sample counts too) -- both the session export just below and
+	 * the submission loop further down (which runs AFTER the reset) read
+	 * from this captured copy rather than calling
+	 * ln_station_get_position_raw_samples() again too late. */
+	LnRawSample raw_samples_present[LN_STATION_POSITION_COUNT][LN_STATION_MAX_RAW_SAMPLES];
+	int raw_sample_counts_present[LN_STATION_POSITION_COUNT];
 	int present_count = 0;
 	for (i = 0; i < LN_STATION_POSITION_COUNT; i++) {
 		LnPositionResult pos;
 		if (ln_station_get_position_result(ln_station_position_names[i], &pos) && pos.has_result) {
 			positions_present[present_count] = ln_station_position_names[i];
 			results_present[present_count] = pos;
+			raw_sample_counts_present[present_count] = ln_station_get_position_raw_samples(
+				ln_station_position_names[i], raw_samples_present[present_count], LN_STATION_MAX_RAW_SAMPLES);
 			present_count++;
 		}
 	}
@@ -859,6 +878,7 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 	compute_results(w->active_snapshot);
 	char session_out_path[1024];
 	int session_export_rc = ln_station_export_session_json(&ln_ctx, positions_present, results_present, present_count,
+	                                                         raw_samples_present, raw_sample_counts_present,
 	                                                         w->active_snapshot->la, w->active_snapshot->sample_rate,
 	                                                         session_out_path, sizeof(session_out_path));
 	if (session_export_rc) {
@@ -870,9 +890,23 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 	 * operator has chosen to end the session here -- clear the
 	 * per-position results now so the next watch's POSITIONS list and
 	 * ACROSS POSITIONS stats start clean rather than mixing in this
-	 * watch's data. */
+	 * watch's data.
+	 *
+	 * ln_station_panel_reset_session() also clears ctx->identity_id and
+	 * ctx->work_order (it blanks the identity entry field and work order
+	 * field for the next watch) -- same bug class as the raw-sample
+	 * capture above: the submission loop below runs AFTER this reset but
+	 * still needs both, since every submit_timing_result call reads them
+	 * live from ln_ctx rather than a snapshot. Captured here and restored
+	 * right after the reset, before any submission is attempted. */
+	char saved_identity_id[128];
+	char saved_work_order[128];
+	g_strlcpy(saved_identity_id, ln_ctx.identity_id, sizeof(saved_identity_id));
+	g_strlcpy(saved_work_order, ln_ctx.work_order, sizeof(saved_work_order));
 	if (ln_panel_widget)
 		ln_station_panel_reset_session(ln_panel_widget);
+	ln_station_set_identity(&ln_ctx, saved_identity_id);
+	g_strlcpy(ln_ctx.work_order, saved_work_order, sizeof(ln_ctx.work_order));
 
 	/* Submit every captured position to the ERP, chaining them under one
 	 * LN Measurement Session: the first successful submit creates the
@@ -888,14 +922,15 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 
 	int submitted_count = 0, failed_count = 0, disabled = 0;
 	char last_response[4096] = "";
-	char failures[2048] = "";
+	char failures[4096] = "";
 	for (i = 0; i < present_count; i++) {
 		LnTimingResult result;
 		build_ln_timing_result_from_position(w, positions_present[i], &results_present[i], &result);
 		ln_station_set_position(&ln_ctx, positions_present[i]);
 
 		char response[4096];
-		int submit_rc = ln_station_submit_result(&ln_ctx, &result, response, sizeof(response));
+		int submit_rc = ln_station_submit_result(&ln_ctx, &result,
+			raw_samples_present[i], raw_sample_counts_present[i], response, sizeof(response));
 		g_strlcpy(last_response, response, sizeof(last_response));
 
 		if (submit_rc == 0) {
@@ -906,8 +941,17 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 			disabled = 1;
 		} else {
 			failed_count++;
-			char line[256];
-			g_snprintf(line, sizeof(line), "%s: submit failed (code %d)\n", positions_present[i], submit_rc);
+			/* response (set by ln_station_submit_result/ln_erp_config, e.g.
+			 * "ERP connection is not fully configured...", an HTTP status +
+			 * body excerpt, or a network error) carries the actual reason --
+			 * showing only the numeric code and making the operator go dig
+			 * through a redirected stderr log to see it is real friction for
+			 * no benefit, since the message was sitting right here the whole
+			 * time. Truncated to keep one bad HTTP body from crowding out
+			 * the other positions' messages in the combined dialog. */
+			char line[400];
+			g_snprintf(line, sizeof(line), "%s: submit failed (code %d)\n%s\n",
+				positions_present[i], submit_rc, response[0] ? response : "(no error detail returned)");
 			g_strlcat(failures, line, sizeof(failures));
 		}
 	}
@@ -938,7 +982,7 @@ static void complete_ln_session_button(GtkButton *button, struct main_window *w)
 	}
 
 	GtkMessageType message_type = GTK_MESSAGE_INFO;
-	char message[4900];
+	char message[8192];
 	if (disabled && submitted_count == 0 && failed_count == 0) {
 		g_snprintf(message, sizeof(message),
 			"Timing session marked complete (%d position%s).\nLocal copy: %s\nERP submission is disabled in ERP Connection settings.",
