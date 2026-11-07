@@ -18,6 +18,8 @@ tg_timer_SOURCES = src/algo.c \
  src/ln_station_panel.h \
  src/ln_erp_config.c \
  src/ln_erp_config.h \
+ src/ln_scanner.c \
+ src/ln_scanner.h \
  src/ln_signing.c \
  src/ln_signing.h \
  src/ln_canonical.c \

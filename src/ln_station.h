@@ -58,6 +58,23 @@ typedef struct {
     char signature_b64[128];
 } LnMeasurementSignature;
 
+/* One raw reading taken during a position's gated capture window (see
+ * LnCaptureStatus/ln_station_capture_feed below) -- the individual
+ * samples that get averaged into a frozen LnPositionResult, retained
+ * per-position (see ln_station_get_position_raw_samples) so the full
+ * sample series, not just its average, can be exported/submitted
+ * alongside the summary result. 400 covers the longest hold
+ * (Observatory, 20s) several times over even at a fast tick rate;
+ * capture simply stops appending past that rather than growing
+ * unbounded -- see ln_station_capture_feed's own comment. */
+#define LN_STATION_MAX_RAW_SAMPLES 400
+typedef struct {
+    double rate_s_per_day;
+    double beat_error_ms;
+    double amplitude_deg;
+    double bph;
+} LnRawSample;
+
 /* Status of the gated sample-capture window shown in the LN station
  * panel's MEASUREMENT card. Separate from (and does not affect) the
  * always-on rate-only hold indicator driven by ln_station_qa_update_rate
@@ -157,15 +174,40 @@ void ln_station_position_results_reset(void);
 int ln_station_get_position_result(const char *position, LnPositionResult *out);
 void ln_station_position_rate_stats(LnPositionRateStats *out);
 
-int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len);
-int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len);
+/* Copies up to max_out raw samples captured during this position's most
+ * recently completed capture window into out (see LnRawSample above),
+ * returning the actual count copied. Returns 0 if this position has no
+ * completed capture yet (e.g. only ever measured via the live-snapshot
+ * fallback, never Start Capture) -- callers should treat that as "no
+ * raw samples to attach", not an error. */
+int ln_station_get_position_raw_samples(const char *position, LnRawSample *out, int max_out);
+
+/* raw_samples/raw_sample_count are optional (pass NULL/0 if this result
+ * has no completed capture window behind it -- see
+ * ln_station_get_position_raw_samples) -- the "raw_samples" field is
+ * then omitted entirely rather than sent as an empty array, same
+ * convention as signatures/signature_count elsewhere. Deliberately NOT
+ * part of the Ed25519-signed canonical form (see
+ * ln_canonical_timing_result_json) -- treated as wire-only supplementary
+ * data, like session, not something the signature authenticates. */
+int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result,
+                           const LnRawSample *raw_samples, int raw_sample_count,
+                           char *out_path, unsigned long out_path_len);
+int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result,
+                             const LnRawSample *raw_samples, int raw_sample_count,
+                             char *response, unsigned long response_len);
 
 /* Saves one combined JSON file covering every position with a completed
  * result so far (see LnPositionResult) -- the "full session" archive,
  * as opposed to ln_station_export_json's single-reading file. `positions`
- * and `results` are parallel arrays of length `count`. */
+ * and `results` are parallel arrays of length `count`; `raw_samples` is a
+ * fixed-width 2D array (one row of up to LN_STATION_MAX_RAW_SAMPLES per
+ * position, same order as `positions`/`results`) and `raw_sample_counts`
+ * is a parallel array of how many of each row are actually populated. */
 int ln_station_export_session_json(const LnStationContext *ctx, const char *positions[],
                                     const LnPositionResult results[], int count,
+                                    const LnRawSample raw_samples[][LN_STATION_MAX_RAW_SAMPLES],
+                                    const int raw_sample_counts[],
                                     double lift_angle_deg, double sample_rate_hz,
                                     char *out_path, unsigned long out_path_len);
 

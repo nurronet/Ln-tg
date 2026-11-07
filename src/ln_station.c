@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <glib.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,16 +43,9 @@ static time_t ln_station_qa_started_at = 0;
 static int ln_station_qa_passed = 0;
 
 /* Sample-capture window state -- see LnCaptureStatus in ln_station.h.
- * 400 samples covers the longest hold (Observatory, 20s) several times
- * over even at a fast tick rate; capture simply stops appending past
- * that rather than growing unbounded. */
-#define LN_STATION_MAX_CAPTURE_SAMPLES 400
-typedef struct {
-    double rate_s_per_day;
-    double beat_error_ms;
-    double amplitude_deg;
-    double bph;
-} LnCaptureSample;
+ * LnRawSample/LN_STATION_MAX_RAW_SAMPLES are defined there (public) now
+ * that the per-position raw series is retained and exportable, not just
+ * used internally to compute the frozen average. */
 /* After an auto-triggered position change, give the operator time to
  * physically reposition the watch before the hold window starts
  * counting -- otherwise the first few seconds of "capture" are really
@@ -67,7 +61,7 @@ typedef struct {
 #define LN_STATION_CAPTURE_MAX_ABS_RATE_S_PER_DAY 50.0
 #define LN_STATION_CAPTURE_MAX_RATE_DELTA_S_PER_DAY 10.0
 
-static LnCaptureSample ln_station_capture_samples[LN_STATION_MAX_CAPTURE_SAMPLES];
+static LnRawSample ln_station_capture_samples[LN_STATION_MAX_RAW_SAMPLES];
 static int ln_station_capture_sample_count = 0;
 static int ln_station_capture_active = 0;
 static int ln_station_capture_finished = 0;
@@ -85,12 +79,26 @@ typedef struct {
 } LnStationPositionResultSlot;
 static LnStationPositionResultSlot ln_station_position_results[6];
 
+/* The raw sample series behind each frozen LnPositionResult above, kept
+ * in the same slot ordering (index i's raw samples belong to
+ * ln_station_position_results[i]). Populated once, at the moment a
+ * capture window freezes (see ln_station_position_results_store) --
+ * never mutated afterward until a session reset. */
+static LnRawSample ln_station_position_raw_samples[6][LN_STATION_MAX_RAW_SAMPLES];
+static int ln_station_position_raw_sample_counts[6];
+
 static void ln_station_capture_reset_for_new_position(void);
 
 static void safe_copy(char *dst, unsigned long dst_len, const char *src) {
     if (!dst || dst_len == 0) return;
     if (!src) src = "";
-    snprintf(dst, dst_len, "%s", src);
+    /* g_strlcpy, not snprintf(dst, dst_len, "%s", src): functionally
+     * identical (bounded, always null-terminated), but it isn't a printf-
+     * family call, so it doesn't trip -Wformat-truncation on the call
+     * sites here that intentionally truncate a longer source (e.g. a
+     * 2048-byte HTTP response body) into a smaller fixed buffer -- that's
+     * this function's entire purpose, not a bug for the warning to catch. */
+    g_strlcpy(dst, src, dst_len);
 }
 
 static void json_escape_gstring(GString *out, const char *s) {
@@ -116,6 +124,14 @@ static void json_escape_gstring(GString *out, const char *s) {
  * (HTTP POST body) so both always serialize the ln_tg_timing_result_v1
  * schema identically. Caller owns the returned GString.
  *
+ * `raw_samples`/`raw_sample_count` are optional (pass NULL/0 if this
+ * result has no completed capture window behind it -- see
+ * ln_station_get_position_raw_samples) -- omitted entirely rather than
+ * sent as an empty array, same convention as signatures below.
+ * Deliberately NOT part of the signed canonical form (see
+ * ln_canonical_timing_result_json) -- the signature authenticates the
+ * summary measurement, not the raw series behind it.
+ *
  * `signatures`/`signature_count` are optional (pass NULL/0 for an unsigned
  * export or submission -- the field is omitted entirely rather than sent
  * as an empty array, matching the server's own "no signatures key present"
@@ -123,6 +139,7 @@ static void json_escape_gstring(GString *out, const char *s) {
  * wire/export form; it is NOT the canonical form used for signing -- see
  * ln_canonical_timing_result_json() for that. */
 static GString *build_timing_result_json(const LnStationContext *ctx, const LnTimingResult *result,
+                                          const LnRawSample *raw_samples, int raw_sample_count,
                                           const LnMeasurementSignature *signatures, int signature_count) {
     GString *out = g_string_sized_new(1024);
 
@@ -158,6 +175,19 @@ static GString *build_timing_result_json(const LnStationContext *ctx, const LnTi
     g_string_append_printf(out, "    \"beat_error_ms\": %.6f,\n", result->baseline_beat_error_ms);
     g_string_append_printf(out, "    \"amplitude_deg\": %.6f\n", result->baseline_amplitude_deg);
     g_string_append(out, "  },\n");
+    if (raw_samples && raw_sample_count > 0) {
+        int i;
+        g_string_append(out, "  \"raw_samples\": [\n");
+        for (i = 0; i < raw_sample_count; i++) {
+            g_string_append(out, "    {");
+            g_string_append_printf(out, "\"rate_s_per_day\": %.6f, ", raw_samples[i].rate_s_per_day);
+            g_string_append_printf(out, "\"beat_error_ms\": %.6f, ", raw_samples[i].beat_error_ms);
+            g_string_append_printf(out, "\"amplitude_deg\": %.6f, ", raw_samples[i].amplitude_deg);
+            g_string_append_printf(out, "\"beat_frequency_bph\": %.6f", raw_samples[i].bph);
+            g_string_append(out, i + 1 < raw_sample_count ? "},\n" : "}\n");
+        }
+        g_string_append(out, "  ],\n");
+    }
     if (signatures && signature_count > 0) {
         int i;
         g_string_append(out, "  \"notes\": "); json_escape_gstring(out, result->notes); g_string_append(out, ",\n");
@@ -466,6 +496,20 @@ static void ln_station_position_results_store(double rate_s_per_day, double beat
     ln_station_position_results[slot].result.bph = bph;
     ln_station_position_results[slot].result.sample_count = sample_count;
     ln_station_position_results[slot].result.elapsed_seconds = elapsed_seconds;
+
+    /* Retain the raw series behind this average in the same slot, so
+     * it's still available later at export/submit time (see
+     * ln_station_get_position_raw_samples) even after the next
+     * position's capture overwrites ln_station_capture_samples. */
+    {
+        int n = ln_station_capture_sample_count;
+        if (n > LN_STATION_MAX_RAW_SAMPLES) n = LN_STATION_MAX_RAW_SAMPLES;
+        if (n > 0) {
+            memcpy(ln_station_position_raw_samples[slot], ln_station_capture_samples,
+                   (size_t)n * sizeof(LnRawSample));
+        }
+        ln_station_position_raw_sample_counts[slot] = n;
+    }
 }
 
 void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double amplitude_deg, double bph, int valid) {
@@ -526,8 +570,8 @@ void ln_station_capture_feed(double rate_s_per_day, double beat_error_ms, double
     if (!ln_station_capture_started_at)
         ln_station_capture_started_at = now_t;
 
-    if (ln_station_capture_sample_count < LN_STATION_MAX_CAPTURE_SAMPLES) {
-        LnCaptureSample *s = &ln_station_capture_samples[ln_station_capture_sample_count];
+    if (ln_station_capture_sample_count < LN_STATION_MAX_RAW_SAMPLES) {
+        LnRawSample *s = &ln_station_capture_samples[ln_station_capture_sample_count];
         s->rate_s_per_day = rate_s_per_day;
         s->beat_error_ms = beat_error_ms;
         s->amplitude_deg = amplitude_deg;
@@ -597,6 +641,7 @@ int ln_station_capture_is_auto(void) {
 
 void ln_station_position_results_reset(void) {
     memset(ln_station_position_results, 0, sizeof(ln_station_position_results));
+    memset(ln_station_position_raw_sample_counts, 0, sizeof(ln_station_position_raw_sample_counts));
 }
 
 int ln_station_get_position_result(const char *position, LnPositionResult *out) {
@@ -607,6 +652,21 @@ int ln_station_get_position_result(const char *position, LnPositionResult *out) 
             && strcmp(ln_station_position_results[i].position, position) == 0) {
             *out = ln_station_position_results[i].result;
             return 1;
+        }
+    }
+    return 0;
+}
+
+int ln_station_get_position_raw_samples(const char *position, LnRawSample *out, int max_out) {
+    int i;
+    if (!position || !out || max_out <= 0) return 0;
+    for (i = 0; i < 6; i++) {
+        if (ln_station_position_results[i].result.has_result
+            && strcmp(ln_station_position_results[i].position, position) == 0) {
+            int n = ln_station_position_raw_sample_counts[i];
+            if (n > max_out) n = max_out;
+            if (n > 0) memcpy(out, ln_station_position_raw_samples[i], (size_t)n * sizeof(LnRawSample));
+            return n;
         }
     }
     return 0;
@@ -647,7 +707,9 @@ void ln_station_position_rate_stats(LnPositionRateStats *out) {
     }
 }
 
-int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result, char *out_path, unsigned long out_path_len) {
+int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *result,
+                           const LnRawSample *raw_samples, int raw_sample_count,
+                           char *out_path, unsigned long out_path_len) {
     char stamp[32];
     char safe_identity[160];
     char path[1024];
@@ -682,7 +744,7 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
         return -2;
     }
 
-    body = build_timing_result_json(ctx, result, NULL, 0);
+    body = build_timing_result_json(ctx, result, raw_samples, raw_sample_count, NULL, 0);
     fputs(body->str, f);
     g_string_free(body, TRUE);
     fclose(f);
@@ -693,6 +755,8 @@ int ln_station_export_json(const LnStationContext *ctx, const LnTimingResult *re
 
 int ln_station_export_session_json(const LnStationContext *ctx, const char *positions[],
                                     const LnPositionResult results[], int count,
+                                    const LnRawSample raw_samples[][LN_STATION_MAX_RAW_SAMPLES],
+                                    const int raw_sample_counts[],
                                     double lift_angle_deg, double sample_rate_hz,
                                     char *out_path, unsigned long out_path_len) {
     char stamp[32];
@@ -750,6 +814,7 @@ int ln_station_export_session_json(const LnStationContext *ctx, const char *posi
     g_string_append_printf(body, "  \"sample_rate_hz\": %.6f,\n", sample_rate_hz);
     g_string_append(body, "  \"positions\": [\n");
     for (j = 0; j < count; j++) {
+        int raw_count = raw_sample_counts ? raw_sample_counts[j] : 0;
         g_string_append(body, "    {\n");
         g_string_append(body, "      \"position\": "); json_escape_gstring(body, positions[j]); g_string_append(body, ",\n");
         g_string_append_printf(body, "      \"rate_s_per_day\": %.6f,\n", results[j].rate_s_per_day);
@@ -757,7 +822,20 @@ int ln_station_export_session_json(const LnStationContext *ctx, const char *posi
         g_string_append_printf(body, "      \"amplitude_deg\": %.6f,\n", results[j].amplitude_deg);
         g_string_append_printf(body, "      \"beat_frequency_bph\": %.6f,\n", results[j].bph);
         g_string_append_printf(body, "      \"sample_count\": %d,\n", results[j].sample_count);
-        g_string_append_printf(body, "      \"duration_seconds\": %.6f\n", results[j].elapsed_seconds);
+        g_string_append_printf(body, "      \"duration_seconds\": %.6f%s\n", results[j].elapsed_seconds, raw_count > 0 ? "," : "");
+        if (raw_count > 0) {
+            int k;
+            g_string_append(body, "      \"raw_samples\": [\n");
+            for (k = 0; k < raw_count; k++) {
+                g_string_append(body, "        {");
+                g_string_append_printf(body, "\"rate_s_per_day\": %.6f, ", raw_samples[j][k].rate_s_per_day);
+                g_string_append_printf(body, "\"beat_error_ms\": %.6f, ", raw_samples[j][k].beat_error_ms);
+                g_string_append_printf(body, "\"amplitude_deg\": %.6f, ", raw_samples[j][k].amplitude_deg);
+                g_string_append_printf(body, "\"beat_frequency_bph\": %.6f", raw_samples[j][k].bph);
+                g_string_append(body, k + 1 < raw_count ? "},\n" : "}\n");
+            }
+            g_string_append(body, "      ]\n");
+        }
         g_string_append(body, j + 1 < count ? "    },\n" : "    }\n");
     }
     g_string_append(body, "  ]\n");
@@ -792,6 +870,41 @@ static size_t ln_response_write(void *contents, size_t size, size_t nmemb, void 
         response->buffer[response->length] = '\0';
     }
     return bytes;
+}
+
+/* Every ERP-facing diagnostic line in this file used to go to stderr only
+ * (fprintf(stderr, "[LNWS ...")) -- fine at a dev machine's terminal, but
+ * this app runs unattended on workshop stations with no console attached
+ * and no log collection, so a failed submission left nothing behind to
+ * diagnose after the fact (see the "no logging" gap that made the
+ * identity/work_order-cleared-before-submit bug so hard to pin down
+ * without a station-side error to look at). Appends one line per call to
+ * <export_dir>/ln-tg-submit.log, right next to the JSON exports -- pulled
+ * off with the same USB cycle used to update the station, no separate
+ * collection step needed. Still also writes to stderr (unchanged, in case
+ * anything is watching it), and is silently a no-op if the log file can't
+ * be opened -- a stuck log must never block or crash a real measurement. */
+static void ln_station_log(const LnStationContext *ctx, const char *fmt, ...) {
+    char message[2048];
+    char path[1024];
+    char stamp[64];
+    va_list args;
+    FILE *f;
+
+    va_start(args, fmt);
+    g_vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+
+    fputs(message, stderr);
+    fflush(stderr);
+
+    g_snprintf(path, sizeof(path), "%s%c%s",
+               ctx && ctx->export_dir[0] ? ctx->export_dir : ".", G_DIR_SEPARATOR, "ln-tg-submit.log");
+    f = fopen(path, "a");
+    if (!f) return;
+    now_iso(stamp, sizeof(stamp));
+    fprintf(f, "%s %s", stamp, message);
+    fclose(f);
 }
 
 /* Shared by ln_station_submit_result and ln_station_register_workstation_key
@@ -840,6 +953,8 @@ static int ln_station_http_post_json(const LnStationContext *ctx, const char *me
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, ctx->verify_tls ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, ctx->verify_tls ? 2L : 0L);
 
+    ln_station_log(ctx, "[LNWS POST] %s\n", url);
+
     curl_result = curl_easy_perform(curl);
     if (curl_result == CURLE_OK) {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
@@ -850,11 +965,14 @@ static int ln_station_http_post_json(const LnStationContext *ctx, const char *me
 
     if (curl_result != CURLE_OK) {
         safe_copy(response, response_len, curl_easy_strerror(curl_result));
+        ln_station_log(ctx, "[LNWS POST] ERROR: %s\n", curl_easy_strerror(curl_result));
         return curl_result == CURLE_OPERATION_TIMEDOUT ? -408 : -3;
     }
     if (status < 200 || status >= 300) {
+        ln_station_log(ctx, "[LNWS POST] HTTP %ld: %s\n", status, response && response[0] ? response : "(no response body)");
         return (int)status;
     }
+    ln_station_log(ctx, "[LNWS POST] SUCCESS: HTTP %ld\n", status);
     return 0;
 }
 
@@ -944,12 +1062,10 @@ static int ln_station_ensure_workstation_key(const LnStationContext *ctx, char *
     {
         char register_error[512] = "";
         if (ln_station_register_workstation_key(ctx, &g_workstation_keypair, register_error, sizeof(register_error)) != 0) {
-            fprintf(stderr, "[LNWS SIGN] WARNING: workstation key registration failed, submissions will sign but may not verify until this succeeds: %s\n",
+            ln_station_log(ctx, "[LNWS SIGN] WARNING: workstation key registration failed, submissions will sign but may not verify until this succeeds: %s\n",
                     register_error);
-            fflush(stderr);
         } else {
-            fprintf(stderr, "[LNWS SIGN] Registered new workstation signing key '%s'\n", key_id);
-            fflush(stderr);
+            ln_station_log(ctx, "[LNWS SIGN] Registered new workstation signing key '%s'\n", key_id);
         }
     }
 
@@ -957,7 +1073,9 @@ static int ln_station_ensure_workstation_key(const LnStationContext *ctx, char *
     return 0;
 }
 
-int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result, char *response, unsigned long response_len) {
+int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *result,
+                             const LnRawSample *raw_samples, int raw_sample_count,
+                             char *response, unsigned long response_len) {
     CURL *curl;
     CURLcode curl_result;
     struct curl_slist *headers = NULL;
@@ -1006,14 +1124,12 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
                 safe_copy(signature.signer_type, sizeof(signature.signer_type), "Workstation");
                 signature_count = 1;
             } else {
-                fprintf(stderr, "[LNWS SIGN] WARNING: failed to sign timing result, submitting unsigned\n");
-                fflush(stderr);
+                ln_station_log(ctx, "[LNWS SIGN] WARNING: failed to sign timing result, submitting unsigned\n");
             }
             g_string_free(canonical, TRUE);
         } else {
-            fprintf(stderr, "[LNWS SIGN] WARNING: workstation key unavailable (%s), submitting unsigned\n",
+            ln_station_log(ctx, "[LNWS SIGN] WARNING: workstation key unavailable (%s), submitting unsigned\n",
                     sign_error[0] ? sign_error : "unknown error");
-            fflush(stderr);
         }
     }
 
@@ -1024,7 +1140,8 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
         return -2;
     }
 
-    body = build_timing_result_json(ctx, result, signature_count > 0 ? &signature : NULL, signature_count);
+    body = build_timing_result_json(ctx, result, raw_samples, raw_sample_count,
+                                     signature_count > 0 ? &signature : NULL, signature_count);
 
     g_snprintf(url, sizeof(url), "%s/api/method/ln_watch_inventory.freeerp.submit_timing_result", ctx->erp_base_url);
     g_snprintf(auth, sizeof(auth), "Authorization: token %s:%s", ctx->api_key, ctx->api_secret);
@@ -1051,9 +1168,8 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, ctx->verify_tls ? 1L : 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, ctx->verify_tls ? 2L : 0L);
 
-    fprintf(stderr, "[LNWS SUBMIT] POST %s (identity=%s position=%s, %s)\n", url, ctx->identity_id, ctx->position,
+    ln_station_log(ctx, "[LNWS SUBMIT] POST %s (identity=%s position=%s, %s)\n", url, ctx->identity_id, ctx->position,
             signature_count > 0 ? "signed" : "unsigned");
-    fflush(stderr);
 
     curl_result = curl_easy_perform(curl);
     if (curl_result == CURLE_OK) {
@@ -1071,8 +1187,7 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
         g_snprintf(message, sizeof(message),
                    "Network error: %s (connect timeout 8s, total timeout 20s)",
                    curl_easy_strerror(curl_result));
-        fprintf(stderr, "[LNWS SUBMIT] ERROR: %s\n", message);
-        fflush(stderr);
+        ln_station_log(ctx, "[LNWS SUBMIT] ERROR: %s\n", message);
         safe_copy(response, response_len, message);
         return curl_result == CURLE_OPERATION_TIMEDOUT ? -408 : -3;
     }
@@ -1084,15 +1199,13 @@ int ln_station_submit_result(const LnStationContext *ctx, const LnTimingResult *
         g_snprintf(message, sizeof(message),
                    "HTTP %ld after %.0f ms (connect %.0f ms)\n%s",
                    status, total_seconds * 1000.0, connect_seconds * 1000.0, body_excerpt);
-        fprintf(stderr, "[LNWS SUBMIT] HTTP ERROR: %s\n", message);
-        fflush(stderr);
+        ln_station_log(ctx, "[LNWS SUBMIT] HTTP ERROR: %s\n", message);
         safe_copy(response, response_len, message);
         return (int)status;
     }
 
-    fprintf(stderr, "[LNWS SUBMIT] SUCCESS: HTTP %ld in %.0f ms (connect %.0f ms)\n",
+    ln_station_log(ctx, "[LNWS SUBMIT] SUCCESS: HTTP %ld in %.0f ms (connect %.0f ms)\n",
             status, total_seconds * 1000.0, connect_seconds * 1000.0);
-    fflush(stderr);
     return 0;
 }
 
